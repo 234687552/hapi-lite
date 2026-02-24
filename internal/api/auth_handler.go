@@ -9,23 +9,11 @@ import (
 	"github.com/liangzd/hapi-lite/internal/config"
 )
 
-type authBody struct {
-	AccessToken string `json:"accessToken"`
-	InitData    string `json:"initData"`
-}
-
 func AuthHandler(c *gin.Context) {
-	var body authBody
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid body"})
-		return
+	var body struct {
+		AccessToken string `json:"accessToken"`
 	}
-
-	if body.AccessToken == "" && body.InitData != "" {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Telegram auth is not enabled in hapi-lite"})
-		return
-	}
-	if body.AccessToken == "" {
+	if err := c.ShouldBindJSON(&body); err != nil || body.AccessToken == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "accessToken is required"})
 		return
 	}
@@ -45,8 +33,4 @@ func AuthHandler(c *gin.Context) {
 		"token": token,
 		"user":  gin.H{"id": 1, "firstName": "Web User"},
 	})
-}
-
-func BindHandler(c *gin.Context) {
-	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Telegram binding is not supported in hapi-lite"})
 }

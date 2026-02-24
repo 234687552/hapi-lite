@@ -42,14 +42,19 @@ export function HappyComposer(props: {
     active?: boolean
     allowSendWhenInactive?: boolean
     thinking?: boolean
+    activeAt?: number
+    thinkingAt?: number
     agentState?: AgentState | null
     contextSize?: number
+    inputTokens?: number
+    outputTokens?: number
     controlledByUser?: boolean
     agentFlavor?: string | null
     onPermissionModeChange?: (mode: PermissionMode) => void
     onModelModeChange?: (mode: ModelMode) => void
     onSwitchToRemote?: () => void
     onTerminal?: () => void
+    onDirectSend?: (text: string) => void
     autocompletePrefixes?: string[]
     autocompleteSuggestions?: (query: string) => Promise<Suggestion[]>
 }) {
@@ -61,14 +66,19 @@ export function HappyComposer(props: {
         active = true,
         allowSendWhenInactive = false,
         thinking = false,
+        activeAt,
+        thinkingAt,
         agentState,
         contextSize,
+        inputTokens,
+        outputTokens,
         controlledByUser = false,
         agentFlavor,
         onPermissionModeChange,
         onModelModeChange,
         onSwitchToRemote,
         onTerminal,
+        onDirectSend,
         autocompletePrefixes = ['@', '/', '$'],
         autocompleteSuggestions = defaultSuggestionHandler
     } = props
@@ -107,6 +117,7 @@ export function HappyComposer(props: {
     const [isAborting, setIsAborting] = useState(false)
     const [isSwitching, setIsSwitching] = useState(false)
     const [showContinueHint, setShowContinueHint] = useState(false)
+    const [runtimeThinkingAt, setRuntimeThinkingAt] = useState<number | null>(null)
 
     const textareaRef = useRef<HTMLTextAreaElement>(null)
     const prevControlledByUser = useRef(controlledByUser)
@@ -153,7 +164,7 @@ export function HappyComposer(props: {
         }
     }, [platformHaptic])
 
-    const handleSuggestionSelect = useCallback((index: number) => {
+    const handleSuggestionSelect = useCallback((index: number, options?: { sendIfSlash: boolean }) => {
         const suggestion = suggestions[index]
         if (!suggestion || !textareaRef.current) return
         if (suggestion.text.startsWith('$')) {
@@ -168,13 +179,32 @@ export function HappyComposer(props: {
             addSpace = false
         }
 
+        const shouldSendImmediately = Boolean(options?.sendIfSlash && suggestion.text.startsWith('/'))
         const result = applySuggestion(
             inputState.text,
             inputState.selection,
             textToInsert,
             autocompletePrefixes,
-            addSpace
+            shouldSendImmediately ? false : addSpace
         )
+
+        if (shouldSendImmediately) {
+            if (canSend) {
+                if (onDirectSend) {
+                    onDirectSend(result.text)
+                    api.composer().setText('')
+                    setInputState({ text: '', selection: { start: 0, end: 0 } })
+                    clearSuggestions()
+                } else {
+                    api.composer().setText(result.text)
+                    setTimeout(() => {
+                        api.composer().send()
+                    }, 0)
+                }
+            }
+            haptic('light')
+            return
+        }
 
         api.composer().setText(result.text)
         setInputState({
@@ -194,7 +224,7 @@ export function HappyComposer(props: {
         }, 0)
 
         haptic('light')
-    }, [api, suggestions, inputState, autocompletePrefixes, haptic, agentFlavor])
+    }, [api, suggestions, inputState, autocompletePrefixes, haptic, agentFlavor, canSend, onDirectSend, clearSuggestions])
 
     const abortDisabled = controlsDisabled || isAborting || !threadIsRunning
     const switchDisabled = controlsDisabled || isSwitching || !controlledByUser
@@ -206,6 +236,15 @@ export function HappyComposer(props: {
         if (threadIsRunning) return
         setIsAborting(false)
     }, [isAborting, threadIsRunning])
+
+    useEffect(() => {
+        const runtimeThinking = threadIsRunning || thinking || disabled || isAborting
+        if (runtimeThinking) {
+            setRuntimeThinkingAt((prev) => prev ?? Date.now())
+            return
+        }
+        setRuntimeThinkingAt(null)
+    }, [threadIsRunning, thinking, disabled, isAborting])
 
     useEffect(() => {
         if (!isSwitching) return
@@ -379,6 +418,10 @@ export function HappyComposer(props: {
     const showPermissionSettings = Boolean(onPermissionModeChange && permissionModeOptions.length > 0)
     const showModelSettings = Boolean(onModelModeChange && !isCodexFamilyFlavor(agentFlavor))
     const showSettingsButton = Boolean(showPermissionSettings || showModelSettings)
+    const statusThinking = thinking || threadIsRunning || disabled || isAborting
+    const statusThinkingAt = (typeof thinkingAt === 'number' && thinkingAt > 0)
+        ? thinkingAt
+        : (runtimeThinkingAt ?? undefined)
 
     const handleSend = useCallback(() => {
         api.composer().send()
@@ -478,7 +521,7 @@ export function HappyComposer(props: {
                         <Autocomplete
                             suggestions={suggestions}
                             selectedIndex={selectedIndex}
-                            onSelect={(index) => handleSuggestionSelect(index)}
+                            onSelect={(index) => handleSuggestionSelect(index, { sendIfSlash: true })}
                         />
                     </FloatingOverlay>
                 </div>
@@ -509,9 +552,13 @@ export function HappyComposer(props: {
 
                     <StatusBar
                         active={active}
-                        thinking={thinking}
+                        thinking={statusThinking}
+                        activeAt={activeAt}
+                        thinkingAt={statusThinkingAt}
                         agentState={agentState}
                         contextSize={contextSize}
+                        inputTokens={inputTokens}
+                        outputTokens={outputTokens}
                         modelMode={modelMode}
                         permissionMode={permissionMode}
                         agentFlavor={agentFlavor}

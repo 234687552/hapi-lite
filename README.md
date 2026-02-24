@@ -1,337 +1,644 @@
-# hapi-lite 仓库说明文档
+# hapi-lite 架构与代码说明
 
-## 1. 项目概述
-`hapi-lite` 是一个 **Go 后端 + React 前端** 的轻量级会话管理与 AI Agent 交互系统。
+## 一、项目定位
 
-核心能力：
-- 会话管理（创建、恢复、归档、删除、改名）。
-- 消息收发与分页拉取。
-- 多 Agent 风味支持（claude、codex、gemini、opencode）。
-- 文件浏览/检索/读取、Git 状态与 Diff。
-- SSE 实时事件推送。
-- 前端 PWA、国际化、聊天 UI 与工具调用卡片展示。
+hapi-lite 是一个轻量级的 AI 编程助手聚合平台，提供统一的 Web UI 来管理和使用多种 AI Coding Agent（claude / codex / gemini / opencode）。后端由 Go 编写，前端为 React/TypeScript SPA，两者打包为单一二进制部署。
 
-## 2. 整体流程架构
-### 2.1 启动流程
-1. `main.go` 启动进程，加载 `config.yaml`（不存在则走默认配置）。
-2. 初始化 SQLite 存储并自动建表。
-3. 初始化 SSE Broker。
-4. 初始化 Session Manager（负责 Agent 进程生命周期）。
-5. 装配 Gin 路由：开放鉴权接口 + 受保护业务接口。
-6. 启动 HTTP 服务（默认 `:8080`）。
-7. 非 `/api/*` 路径由后端直接托管 `web/dist` 静态资源并做 SPA 回退。
+---
 
-### 2.2 业务主流程
-1. 前端通过 `/api/auth` 提交 access token 获取 JWT。
-2. 前端使用 JWT 调用会话/消息/文件/Git 等接口。
-3. 会话发送消息时，若对应 Agent 未运行则按需拉起。
-4. Agent 输出被解析后写入 SQLite。
-5. 事件通过 SSE 广播给前端，前端增量刷新会话与消息状态。
+## 二、整体架构图
 
-```mermaid
-flowchart LR
-A[Web Client] -->|POST /api/auth| B[Gin API]
-B --> C[(SQLite)]
-A -->|JWT API| B
-A <-->|SSE /api/events| B
-B --> D[Session Manager]
-D --> E[Agent CLI Process]
-E --> D
-D --> C
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Browser / SPA                            │
+│  React + TypeScript (web/src)                                   │
+│  ┌──────────┐  ┌────────────┐  ┌───────────┐  ┌────────────┐  │
+│  │SessionList│  │SessionChat │  │  FileView │  │  Settings  │  │
+│  └────┬─────┘  └─────┬──────┘  └─────┬─────┘  └────────────┘  │
+│       │              │               │                          │
+│       └──────────────┴───────────────┘                          │
+│              REST API + SSE (EventSource)                        │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ HTTP
+┌──────────────────────────▼──────────────────────────────────────┐
+│                     Go Backend (main.go)                         │
+│                                                                  │
+│  ┌─────────────┐   ┌──────────────┐   ┌──────────────────────┐  │
+│  │  Gin Router │   │  SSE Broker  │   │   SQLite Store       │  │
+│  │  /api/...   │──▶│  (sse/)      │   │   sessions / msgs    │  │
+│  └──────┬──────┘   └──────┬───────┘   └──────────────────────┘  │
+│         │                 │                                      │
+│  ┌──────▼─────────────────▼───────────────────────────────────┐ │
+│  │                  session.Manager                            │ │
+│  │  agents map[sessionID]*AgentProcess                        │ │
+│  │  SpawnAgent / SendMessage / StopAgent / AbortAgent         │ │
+│  └───────────────────────┬────────────────────────────────────┘ │
+│                          │                                       │
+│     ┌────────────────────┼──────────────────────┐               │
+│     ▼                    ▼                       ▼               │
+│  Claude              Codex               Gemini / Opencode       │
+│  (in-process         (in-process         (subprocess +           │
+│   stdout parse)       stdout parse)       file scanner)          │
+└─────────────────────────────────────────────────────────────────┘
+                          │ exec.Cmd
+    ┌─────────────────────┼────────────────────────────┐
+    ▼                     ▼                            ▼
+claude CLI           codex CLI              gemini / opencode CLI
+(stream-json)        (--json)               (output → ~/.xxx/sessions/*.jsonl)
 ```
 
-## 3. 技术架构
-### 3.1 后端
-- 语言与运行时：Go 1.24.x
-- Web 框架：Gin
-- 鉴权：JWT（HS256）
-- 存储：SQLite（WAL）
-- 实时通信：SSE（发布订阅 Broker）
-- 进程执行：`os/exec` 调用外部 Agent CLI
+---
 
-### 3.2 前端
-- 框架：React 19 + TypeScript
-- 构建工具：Vite
-- 路由：TanStack Router
-- 数据层：TanStack Query
-- UI：TailwindCSS + 组件化模块
-- 实时：SSE（消息/会话状态同步）
-- PWA：`vite-plugin-pwa`
-- 终端：xterm.js + socket.io-client（前端侧）
+## 三、多 Agent 管理与会话流程
 
-### 3.3 部署形态
-- 开发态：后端独立运行，前端由 Vite Dev Server 运行并反向代理 `/api`。
-- 生产态：后端进程托管 `web/dist` 静态文件（当前代码未使用 `go:embed`，需保留 `web/dist` 目录）。
+### 3.1 会话创建流程
 
-## 4. 开发说明
-### 4.1 环境要求
-- Go 1.24+
-- Node.js + npm
+```
+Client                  API                  Manager               Agent CLI
+  │                      │                      │                      │
+  │  POST /api/sessions  │                      │                      │
+  │─────────────────────▶│                      │                      │
+  │  {directory, agent,  │                      │                      │
+  │   model, yolo}       │                      │                      │
+  │                      │ Store.CreateSession() │                      │
+  │                      │──────────────────────▶ (SQLite insert)      │
+  │                      │                      │                      │
+  │                      │ Mgr.SpawnAgent()     │                      │
+  │                      │─────────────────────▶│                      │
+  │                      │                      │ (create AgentProcess)│
+  │                      │                      │                      │
+  │                      │                      │ start file scanner   │
+  │                      │                      │ (gemini/opencode)    │
+  │                      │                      │                      │
+  │  {sessionId}         │                      │                      │
+  │◀─────────────────────│                      │                      │
+  │                      │                      │                      │
+  │  GET /api/events     │                      │                      │
+  │─────────────────────▶│ SSE long connection  │                      │
+```
 
-### 4.2 常用命令
-- 安装前端依赖：`make install-web`
-- 启动后端（开发）：`make dev`
-- 启动前端 Vite：`make web`
+### 3.2 发送消息 / Agent 运行流程
 
-### 4.3 本地联调建议
-1. 终端 A 执行 `make dev`（后端 `:8080`）。
-2. 终端 B 执行 `make web`（前端开发服务器）。
-3. 在登录页输入 `config.yaml` 里的 `access_token`（默认 `hapi-lite-token`）。
+```
+Client                  API                  Manager               Agent CLI
+  │                      │                      │                      │
+  │  POST /sessions/:id/ │                      │                      │
+  │       messages       │                      │                      │
+  │─────────────────────▶│                      │                      │
+  │                      │ Mgr.SendMessage()    │                      │
+  │                      │─────────────────────▶│                      │
+  │                      │                      │ go runOnce()         │
+  │                      │                      │─────────────────────▶│
+  │  {ok:true}           │                      │                      │
+  │◀─────────────────────│                      │  exec.Command(...)   │
+  │                      │                      │  cmd.Start()         │
+  │                      │         ┌────────────┘                      │
+  │                      │         │ stdout scan / file tail           │
+  │                      │         │ parse JSON lines                  │
+  │                      │         │                                   │
+  │                      │         │ emitMessage()                     │
+  │                      │         │  → Store.InsertMessage()          │
+  │                      │         │  → Broker.Publish(SyncEvent)      │
+  │                      │         │                                   │
+  │  SSE: message-received         │                                   │
+  │◀───────────────────────────────┘                                   │
+```
 
-## 5. 编译与运行说明
-### 5.1 构建
-- 仅后端二进制：`make build`
-- 仅前端静态资源：`make build-web`
-- 前后端一起构建：`make build-all`
+### 3.3 删除会话流程
 
-### 5.2 运行
-- 运行后端：`./hapi-lite`
-- 默认监听端口：`8080`（可由 `config.yaml` 配置）
+> **前提条件**：会话必须处于非活跃状态（已归档）。若会话仍在运行，需先调用 Archive 接口将其停止，否则返回 409。
 
-### 5.3 打包注意事项
-- 当前仓库是“后端托管前端静态文件”的模式，不是前端内嵌到二进制。
-- 发布时需要保证二进制旁存在 `web/dist` 目录（或改造为 embed 模式）。
+```
+Client                  API                  Manager               SQLite
+  │                      │                      │                      │
+  │  DELETE              │                      │                      │
+  │  /api/sessions/:id   │                      │                      │
+  │─────────────────────▶│                      │                      │
+  │                      │ Store.GetSession(id) │                      │
+  │                      │─────────────────────────────────────────────▶
+  │                      │◀─────────────────────────────── sess ────────
+  │                      │                      │                      │
+  │  ← 404 Not Found     │ [sess == nil]        │                      │
+  │◀─────────────────────│                      │                      │
+  │                      │                      │                      │
+  │  ← 409 Conflict      │ [sess.Active==true]  │                      │
+  │◀─────────────────────│ "Archive it first"   │                      │
+  │                      │                      │                      │
+  │                      │ Mgr.StopAgent(id)    │                      │
+  │                      │─────────────────────▶│                      │
+  │                      │                      │ 关闭 stdout 管道 /   │
+  │                      │                      │ 停止 file scanner    │
+  │                      │                      │                      │
+  │                      │ Store.DeleteSession()│                      │
+  │                      │─────────────────────────────────────────────▶
+  │                      │                      │ (SQLite 事务)        │
+  │                      │                      │ DELETE messages      │
+  │                      │                      │   WHERE session_id   │
+  │                      │                      │ DELETE sessions      │
+  │                      │                      │   WHERE id           │
+  │                      │                      │                      │
+  │                      │ Broker.Publish(      │                      │
+  │                      │  "session-removed")  │                      │
+  │  SSE: session-removed│                      │                      │
+  │◀─────────────────────│                      │                      │
+  │  {ok: true}          │                      │                      │
+  │◀─────────────────────│                      │                      │
+```
 
-## 6. 文件说明范围
-- 以下清单按“当前目录文件”生成，逐文件给出用途说明。
-- `web/node_modules`、`web/dist` 为依赖与构建产物，文件量巨大，未逐项展开。
+### 3.4 四种 Agent 的接入方式对比
 
-## 7. 逐文件说明（每个文件）
-| 文件 | 说明 |
-|---|---|
-| `.air.toml` | Air 配置文件（当前默认开发流程未使用） |
-| `.gitignore` | 仓库忽略规则 |
-| `.serena/.gitignore` | Serena 工作目录忽略规则 |
-| `.serena/cache/typescript/document_symbols.pkl` | Serena TypeScript 符号缓存 |
-| `.serena/cache/typescript/raw_document_symbols.pkl` | Serena TypeScript 原始符号缓存 |
-| `.serena/project.yml` | Serena 项目元信息 |
-| `Makefile` | 常用开发与构建命令入口 |
-| `config.yaml` | 运行时配置（端口、JWT 密钥、访问令牌、DB 路径） |
-| `go.mod` | Go 模块定义与依赖声明 |
-| `go.sum` | Go 依赖校验和 |
-| `hapi-lite` | 后端已编译二进制产物（运行产物） |
-| `hapi-lite.db` | SQLite 主数据库文件（运行产物） |
-| `hapi-lite.db-shm` | SQLite WAL 共享内存文件（运行产物） |
-| `hapi-lite.db-wal` | SQLite WAL 日志文件（运行产物） |
-| `internal/api/auth_handler.go` | 登录与绑定接口（/api/auth、/api/bind） |
-| `internal/api/base.go` | API Handler 基类（注入 Store、Broker、Manager） |
-| `internal/api/file_handler.go` | 会话文件检索、读取、目录浏览与上传管理接口 |
-| `internal/api/git_handler.go` | 会话目录 Git 状态与 Diff 接口 |
-| `internal/api/machine_handler.go` | 机器列表、会话创建与路径存在性检查接口 |
-| `internal/api/message_handler.go` | 消息分页查询与发送接口 |
-| `internal/api/misc_handler.go` | 可见性与推送占位接口 |
-| `internal/api/permission_handler.go` | 权限请求审批接口 |
-| `internal/api/router.go` | Gin 路由装配、鉴权分组、CORS、SPA 静态托管 |
-| `internal/api/session_handler.go` | 会话 CRUD、恢复、归档、改名、技能/命令列表接口 |
-| `internal/api/sse_handler.go` | SSE 事件订阅与心跳推送接口 |
-| `internal/auth/auth.go` | JWT 生成与中间件鉴权 |
-| `internal/config/config.go` | 配置结构与 config.yaml 加载逻辑 |
-| `internal/scanner/claude.go` | Claude 会话文件扫描器 |
-| `internal/scanner/codex.go` | Codex 会话文件解析与消息转换 |
-| `internal/scanner/codex_test.go` | Codex 消息转换单元测试 |
-| `internal/scanner/gemini.go` | Gemini 会话文件扫描器 |
-| `internal/scanner/opencode.go` | OpenCode 会话文件扫描器 |
-| `internal/scanner/scanner.go` | 扫描器抽象接口与通用消息结构 |
-| `internal/session/manager.go` | Agent 进程生命周期管理、命令执行与消息回传 |
-| `internal/session/types.go` | 会话/消息/请求的核心数据模型定义 |
-| `internal/sse/broker.go` | SSE 订阅发布 Broker |
-| `internal/store/sqlite.go` | SQLite 存储实现、建表迁移与数据访问 |
-| `main.go` | 程序入口：加载配置、初始化存储/SSE/会话管理并启动 HTTP 服务 |
-| `tsconfig.base.json` | 前端 TypeScript 基础配置 |
-| `web/.gitignore` | 前端目录忽略规则 |
-| `web/README.md` | 前端子项目说明文档 |
-| `web/index.html` | Vite HTML 入口模板 |
-| `web/package-lock.json` | NPM 锁定依赖版本 |
-| `web/package.json` | 前端脚本、依赖与构建配置 |
-| `web/postcss.config.cjs` | PostCSS 插件配置 |
-| `web/public/apple-touch-icon-180x180.png` | PWA 与移动端图标资源 |
-| `web/public/favicon.ico` | 站点 favicon |
-| `web/public/icon.svg` | 应用主图标资源 |
-| `web/public/mask-icon.svg` | Safari pinned tab 图标资源 |
-| `web/public/maskable-icon-512x512.png` | PWA maskable 图标资源 |
-| `web/public/pwa-192x192.png` | PWA 图标（192x192） |
-| `web/public/pwa-512x512.png` | PWA 图标（512x512） |
-| `web/public/pwa-64x64.png` | PWA 图标（64x64） |
-| `web/src/App.tsx` | 前端根应用：认证、SSE、路由容器与全局状态管理 |
-| `web/src/api/client.ts` | API 客户端封装（鉴权、请求、错误处理） |
-| `web/src/chat/modelConfig.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/normalize.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/normalizeAgent.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/normalizeUser.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/presentation.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/reconcile.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/reducer.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/reducerCliOutput.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/reducerEvents.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/reducerTimeline.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/reducerTools.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/tracer.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/chat/types.ts` | 聊天状态处理模块（归一化、reducer、展示模型） |
-| `web/src/components/AssistantChat/AttachmentItem.tsx` | Assistant Chat 主体与输入区组件 |
-| `web/src/components/AssistantChat/ComposerButtons.tsx` | Assistant Chat 主体与输入区组件 |
-| `web/src/components/AssistantChat/HappyComposer.tsx` | Assistant Chat 主体与输入区组件 |
-| `web/src/components/AssistantChat/HappyThread.tsx` | Assistant Chat 主体与输入区组件 |
-| `web/src/components/AssistantChat/StatusBar.tsx` | Assistant Chat 主体与输入区组件 |
-| `web/src/components/AssistantChat/context.tsx` | Assistant Chat 主体与输入区组件 |
-| `web/src/components/AssistantChat/messages/AssistantMessage.tsx` | 聊天消息渲染子组件（按消息类型） |
-| `web/src/components/AssistantChat/messages/MessageAttachments.tsx` | 聊天消息渲染子组件（按消息类型） |
-| `web/src/components/AssistantChat/messages/MessageStatusIndicator.tsx` | 聊天消息渲染子组件（按消息类型） |
-| `web/src/components/AssistantChat/messages/SystemMessage.tsx` | 聊天消息渲染子组件（按消息类型） |
-| `web/src/components/AssistantChat/messages/ToolMessage.tsx` | 聊天消息渲染子组件（按消息类型） |
-| `web/src/components/AssistantChat/messages/UserMessage.tsx` | 聊天消息渲染子组件（按消息类型） |
-| `web/src/components/ChatInput/Autocomplete.tsx` | 前端页面与通用组件 |
-| `web/src/components/ChatInput/FloatingOverlay.tsx` | 前端页面与通用组件 |
-| `web/src/components/CliOutputBlock.tsx` | 前端页面与通用组件 |
-| `web/src/components/CodeBlock.tsx` | 前端页面与通用组件 |
-| `web/src/components/DiffView.tsx` | 前端页面与通用组件 |
-| `web/src/components/FileIcon.tsx` | 前端页面与通用组件 |
-| `web/src/components/InstallPrompt.tsx` | 前端页面与通用组件 |
-| `web/src/components/LanguageSwitcher.tsx` | 前端页面与通用组件 |
-| `web/src/components/LazyRainbowText.tsx` | 前端页面与通用组件 |
-| `web/src/components/LoadingState.tsx` | 前端页面与通用组件 |
-| `web/src/components/LoginPrompt.test.tsx` | 前端组件测试 |
-| `web/src/components/LoginPrompt.tsx` | 前端页面与通用组件 |
-| `web/src/components/MachineList.tsx` | 前端页面与通用组件 |
-| `web/src/components/MarkdownRenderer.tsx` | 前端页面与通用组件 |
-| `web/src/components/NewSession/ActionButtons.tsx` | 新建会话页面子组件与配置 |
-| `web/src/components/NewSession/AgentSelector.tsx` | 新建会话页面子组件与配置 |
-| `web/src/components/NewSession/DirectorySection.tsx` | 新建会话页面子组件与配置 |
-| `web/src/components/NewSession/MachineSelector.tsx` | 新建会话页面子组件与配置 |
-| `web/src/components/NewSession/ModelSelector.tsx` | 新建会话页面子组件与配置 |
-| `web/src/components/NewSession/SessionTypeSelector.tsx` | 新建会话页面子组件与配置 |
-| `web/src/components/NewSession/YoloToggle.tsx` | 新建会话页面子组件与配置 |
-| `web/src/components/NewSession/index.tsx` | 新建会话页面子组件与配置 |
-| `web/src/components/NewSession/preferences.test.ts` | 前端组件测试 |
-| `web/src/components/NewSession/preferences.ts` | 新建会话页面子组件与配置 |
-| `web/src/components/NewSession/types.ts` | 新建会话页面子组件与配置 |
-| `web/src/components/OfflineBanner.tsx` | 前端页面与通用组件 |
-| `web/src/components/ReconnectingBanner.tsx` | 前端页面与通用组件 |
-| `web/src/components/RenameSessionDialog.tsx` | 前端页面与通用组件 |
-| `web/src/components/SessionActionMenu.tsx` | 前端页面与通用组件 |
-| `web/src/components/SessionChat.tsx` | 前端页面与通用组件 |
-| `web/src/components/SessionFiles/DirectoryTree.tsx` | 会话文件浏览相关组件 |
-| `web/src/components/SessionHeader.tsx` | 前端页面与通用组件 |
-| `web/src/components/SessionList.tsx` | 前端页面与通用组件 |
-| `web/src/components/SpawnSession.tsx` | 前端页面与通用组件 |
-| `web/src/components/Spinner.tsx` | 前端页面与通用组件 |
-| `web/src/components/SyncingBanner.tsx` | 前端页面与通用组件 |
-| `web/src/components/Terminal/TerminalView.tsx` | 终端展示组件 |
-| `web/src/components/ToastContainer.tsx` | 前端页面与通用组件 |
-| `web/src/components/ToolCard/AskUserQuestionFooter.tsx` | 工具调用卡片与交互逻辑 |
-| `web/src/components/ToolCard/PermissionFooter.tsx` | 工具调用卡片与交互逻辑 |
-| `web/src/components/ToolCard/RequestUserInputFooter.tsx` | 工具调用卡片与交互逻辑 |
-| `web/src/components/ToolCard/ToolCard.tsx` | 工具调用卡片与交互逻辑 |
-| `web/src/components/ToolCard/askUserQuestion.ts` | 工具调用卡片与交互逻辑 |
-| `web/src/components/ToolCard/icons.tsx` | 工具调用卡片与交互逻辑 |
-| `web/src/components/ToolCard/knownTools.tsx` | 工具调用卡片与交互逻辑 |
-| `web/src/components/ToolCard/requestUserInput.ts` | 工具调用卡片与交互逻辑 |
-| `web/src/components/ToolCard/views/AskUserQuestionView.tsx` | 工具调用卡片视图组件 |
-| `web/src/components/ToolCard/views/CodexDiffView.tsx` | 工具调用卡片视图组件 |
-| `web/src/components/ToolCard/views/CodexPatchView.tsx` | 工具调用卡片视图组件 |
-| `web/src/components/ToolCard/views/EditView.tsx` | 工具调用卡片视图组件 |
-| `web/src/components/ToolCard/views/ExitPlanModeView.tsx` | 工具调用卡片视图组件 |
-| `web/src/components/ToolCard/views/MultiEditView.tsx` | 工具调用卡片视图组件 |
-| `web/src/components/ToolCard/views/RequestUserInputView.tsx` | 工具调用卡片视图组件 |
-| `web/src/components/ToolCard/views/TodoWriteView.tsx` | 工具调用卡片视图组件 |
-| `web/src/components/ToolCard/views/WriteView.tsx` | 工具调用卡片视图组件 |
-| `web/src/components/ToolCard/views/_all.tsx` | 工具调用卡片视图组件 |
-| `web/src/components/ToolCard/views/_results.tsx` | 工具调用卡片视图组件 |
-| `web/src/components/assistant-ui/markdown-text.tsx` | assistant-ui 适配与渲染工具 |
-| `web/src/components/assistant-ui/markdown-utils.ts` | assistant-ui 适配与渲染工具 |
-| `web/src/components/assistant-ui/reasoning.tsx` | assistant-ui 适配与渲染工具 |
-| `web/src/components/assistant-ui/shiki-highlighter.tsx` | assistant-ui 适配与渲染工具 |
-| `web/src/components/icons.tsx` | 前端页面与通用组件 |
-| `web/src/components/ui/ConfirmDialog.tsx` | 基础 UI 组件（按钮、对话框、Toast 等） |
-| `web/src/components/ui/Toast.tsx` | 基础 UI 组件（按钮、对话框、Toast 等） |
-| `web/src/components/ui/badge.tsx` | 基础 UI 组件（按钮、对话框、Toast 等） |
-| `web/src/components/ui/button.tsx` | 基础 UI 组件（按钮、对话框、Toast 等） |
-| `web/src/components/ui/card.tsx` | 基础 UI 组件（按钮、对话框、Toast 等） |
-| `web/src/components/ui/dialog.tsx` | 基础 UI 组件（按钮、对话框、Toast 等） |
-| `web/src/hooks/mutations/useSendMessage.ts` | React Query 写操作 Hook |
-| `web/src/hooks/mutations/useSessionActions.ts` | React Query 写操作 Hook |
-| `web/src/hooks/mutations/useSpawnSession.ts` | React Query 写操作 Hook |
-| `web/src/hooks/queries/useGitStatusFiles.ts` | React Query 读操作 Hook |
-| `web/src/hooks/queries/useMachines.ts` | React Query 读操作 Hook |
-| `web/src/hooks/queries/useMessages.ts` | React Query 读操作 Hook |
-| `web/src/hooks/queries/useSession.ts` | React Query 读操作 Hook |
-| `web/src/hooks/queries/useSessionDirectory.ts` | React Query 读操作 Hook |
-| `web/src/hooks/queries/useSessionFileSearch.ts` | React Query 读操作 Hook |
-| `web/src/hooks/queries/useSessions.ts` | React Query 读操作 Hook |
-| `web/src/hooks/queries/useSkills.ts` | React Query 读操作 Hook |
-| `web/src/hooks/queries/useSlashCommands.ts` | React Query 读操作 Hook |
-| `web/src/hooks/useActiveSuggestions.ts` | 前端业务 Hook |
-| `web/src/hooks/useActiveWord.ts` | 前端业务 Hook |
-| `web/src/hooks/useAppGoBack.ts` | 前端业务 Hook |
-| `web/src/hooks/useAuth.ts` | 前端业务 Hook |
-| `web/src/hooks/useAuthSource.ts` | 前端业务 Hook |
-| `web/src/hooks/useCopyToClipboard.ts` | 前端业务 Hook |
-| `web/src/hooks/useDirectorySuggestions.ts` | 前端业务 Hook |
-| `web/src/hooks/useFontScale.ts` | 前端业务 Hook |
-| `web/src/hooks/useLongPress.ts` | 前端业务 Hook |
-| `web/src/hooks/useOnlineStatus.ts` | 前端业务 Hook |
-| `web/src/hooks/usePWAInstall.ts` | 前端业务 Hook |
-| `web/src/hooks/usePlatform.ts` | 前端业务 Hook |
-| `web/src/hooks/usePointerFocusRing.ts` | 前端业务 Hook |
-| `web/src/hooks/usePushNotifications.ts` | 前端业务 Hook |
-| `web/src/hooks/useRecentPaths.ts` | 前端业务 Hook |
-| `web/src/hooks/useSSE.ts` | 前端业务 Hook |
-| `web/src/hooks/useScrollToBottom.ts` | 前端业务 Hook |
-| `web/src/hooks/useServerUrl.ts` | 前端业务 Hook |
-| `web/src/hooks/useSyncingState.ts` | 前端业务 Hook |
-| `web/src/hooks/useTelegram.ts` | 前端业务 Hook |
-| `web/src/hooks/useTerminalSocket.ts` | 前端业务 Hook |
-| `web/src/hooks/useTheme.ts` | 前端业务 Hook |
-| `web/src/hooks/useVisibilityReporter.ts` | 前端业务 Hook |
-| `web/src/index.css` | 全局样式与主题变量 |
-| `web/src/lib/agentFlavorUtils.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/app-context.tsx` | 前端基础库与上下文工具 |
-| `web/src/lib/assistant-runtime.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/attachmentAdapter.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/clipboard.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/fileAttachments.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/gitParsers.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/i18n-context.tsx` | 前端基础库与上下文工具 |
-| `web/src/lib/locales/en.ts` | 国际化语言包与索引 |
-| `web/src/lib/locales/index.ts` | 国际化语言包与索引 |
-| `web/src/lib/locales/zh-CN.ts` | 国际化语言包与索引 |
-| `web/src/lib/message-window-store.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/messages.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/query-client.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/query-keys.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/recent-skills.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/runtime-config.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/shiki.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/terminalFont.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/toast-context.tsx` | 前端基础库与上下文工具 |
-| `web/src/lib/toolInputUtils.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/use-translation.ts` | 前端基础库与上下文工具 |
-| `web/src/lib/utils.ts` | 前端基础库与上下文工具 |
-| `web/src/main.tsx` | 前端启动入口：初始化 Router、QueryClient、PWA、i18n |
-| `web/src/protocol/index.ts` | 协议层类型、Schema 与消息定义 |
-| `web/src/protocol/messages.ts` | 协议层类型、Schema 与消息定义 |
-| `web/src/protocol/modes.ts` | 协议层类型、Schema 与消息定义 |
-| `web/src/protocol/schemas.ts` | 协议层类型、Schema 与消息定义 |
-| `web/src/protocol/sessionSummary.ts` | 协议层类型、Schema 与消息定义 |
-| `web/src/protocol/socket.ts` | 协议层类型、Schema 与消息定义 |
-| `web/src/protocol/types.ts` | 协议层类型、Schema 与消息定义 |
-| `web/src/protocol/utils.ts` | 协议层类型、Schema 与消息定义 |
-| `web/src/protocol/version.ts` | 协议层类型、Schema 与消息定义 |
-| `web/src/router.tsx` | 前端路由定义与页面组合 |
-| `web/src/routes/sessions/file.tsx` | 会话单文件查看页 |
-| `web/src/routes/sessions/files.tsx` | 会话文件树与 Git 文件列表页 |
-| `web/src/routes/sessions/terminal.tsx` | 会话终端页（xterm + socket.io） |
-| `web/src/routes/settings/index.test.tsx` | 设置页单元测试 |
-| `web/src/routes/settings/index.tsx` | 设置页 |
-| `web/src/sw.ts` | PWA Service Worker 入口 |
-| `web/src/test/setup.ts` | 前端测试环境初始化 |
-| `web/src/types/api.ts` | 前端类型定义 |
-| `web/src/types/diff.d.ts` | 前端类型定义 |
-| `web/src/types/global.d.ts` | 前端类型定义 |
-| `web/src/types/pwa.d.ts` | 前端类型定义 |
-| `web/src/utils/applySuggestion.ts` | 前端通用工具函数 |
-| `web/src/utils/findActiveWord.ts` | 前端通用工具函数 |
-| `web/src/utils/path.ts` | 前端通用工具函数 |
-| `web/tailwind.config.ts` | Tailwind 配置 |
-| `web/tsconfig.json` | 前端 TypeScript 工程配置 |
-| `web/vite.config.ts` | Vite 开发服务器、代理、PWA 与构建配置 |
-| `web/vitest.config.ts` | Vitest 测试配置 |
+| Agent        | 启动命令                                       | 消息获取方式                                    | 会话文件路径                         |
+|--------------|------------------------------------------------|-------------------------------------------------|--------------------------------------|
+| **claude**   | `claude --print --output-format stream-json`   | 直接读取 stdout，按行解析 JSON                  | N/A（in-process）                    |
+| **codex**    | `codex exec --json --skip-git-repo-check`      | 直接读取 stdout，解析 `item.completed` 事件     | N/A（in-process）                    |
+| **gemini**   | `gemini <text>`                                | GeminiScanner tail `*.jsonl`                    | `~/.gemini/sessions/*.jsonl`         |
+| **opencode** | `opencode <text>`                              | OpencodeScanner tail `*.jsonl`                  | `~/.opencode/sessions/*.jsonl`       |
+
+**Claude 消息格式**（stream-json 每行）：
+```json
+{"type": "assistant", "content": [...]}
+{"type": "user", "content": [...]}
+{"type": "summary", ...}
+```
+
+**Codex 消息格式**（stdout 事件流，解析 `item.completed`）：
+```json
+{"type": "item.completed", "item": {"type": "agent_message", "text": "..."}}
+{"type": "item.completed", "item": {"type": "reasoning", "text": "..."}}
+{"type": "item.completed", "item": {"type": "tool_call", "name": "...", "call_id": "..."}}
+{"type": "item.completed", "item": {"type": "tool_result", "call_id": "...", "output": "..."}}
+```
+
+**Gemini / Opencode 消息格式**（JSONL 文件行，过滤 user/assistant/summary）：
+```json
+{"type": "user", "content": {...}}
+{"type": "assistant", "content": [...]}
+```
+
+### 3.5 SSE 实时推送
+
+所有 Agent 消息和会话状态变更均通过 SSE 推送到前端：
+
+| SyncEvent type      | 触发时机                        |
+|---------------------|---------------------------------|
+| `session-added`     | 创建新会话                      |
+| `session-updated`   | 会话状态变更（active/model 等） |
+| `session-removed`   | 删除会话                        |
+| `message-received`  | Agent 输出一条新消息            |
+
+---
+
+## 四、鉴权说明
+
+采用两阶段认证：
+
+1. **第一步**：POST `/api/auth`，提交 `accessToken`（与 config.yaml 中的 `access_token` 做常量时间比对），返回 JWT（24h 有效期，HS256，密钥为 `jwt_secret`）。
+
+2. **第二步**：后续所有 `/api/*` 请求携带 `Authorization: Bearer <JWT>`，SSE 连接支持 `?token=<JWT>` 查询参数。
+
+---
+
+## 五、目录结构与文件说明
+
+```
+hapi-lite/
+│
+├── main.go                          # 入口：加载配置、初始化 SQLite/SSE Broker/session.Manager，启动 Gin HTTP 服务
+├── config.yaml                      # 运行时配置：port / jwt_secret / access_token / db_path
+├── go.mod                           # Go 模块定义，依赖：gin / sqlite3 / jwt / uuid 等
+├── go.sum                           # 依赖校验文件
+│
+├── internal/
+│   ├── config/
+│   │   └── config.go                # 配置结构体 Config，从 config.yaml 加载，提供全局变量 C
+│   │
+│   ├── auth/
+│   │   └── auth.go                  # JWT 生成（GenerateToken）与验证（Middleware gin.HandlerFunc）
+│   │
+│   ├── store/
+│   │   └── sqlite.go                # SQLite 数据访问层：sessions 表 + messages 表的 CRUD，消息序号重建
+│   │
+│   ├── session/
+│   │   ├── types.go                 # 核心数据类型：Session / Message / Metadata / AgentState /
+│   │   │                            #   AgentFlavor 常量 / CreateSessionRequest / SyncEvent 等
+│   │   └── manager.go               # Agent 进程管理器：SpawnAgent / SendMessage / StopAgent /
+│   │                                #   runClaude / runCodex / emitMessage；维护 agents map
+│   │
+│   ├── scanner/
+│   │   ├── scanner.go               # Scanner 接口定义：Start / Stop；ScannedMessage / MessageCallback
+│   │   ├── codex.go                 # 共享工具函数：findNewestFile / tailJSONL
+│   │   │                            #   供 GeminiScanner / OpencodeScanner 使用
+│   │   ├── gemini.go                # GeminiScanner：监听 ~/.gemini/sessions/*.jsonl，tail 新增行
+│   │   └── opencode.go              # OpencodeScanner：监听 ~/.opencode/sessions/*.jsonl，tail 新增行
+│   │
+│   ├── sse/
+│   │   └── broker.go                # SSE 事件总线：Client（订阅者）/ Broker（发布/订阅/取消订阅）
+│   │
+│   └── api/
+│       ├── router.go                # 路由注册：公开路由（/auth）+ 受保护路由（JWT Middleware）
+│       ├── base.go                  # BaseHandler：聚合 Store / Broker / Manager 三个依赖
+│       ├── auth_handler.go          # POST /api/auth：accessToken 校验 → 返回 JWT
+│       ├── session_handler.go       # Session CRUD + 控制操作：
+│       │                            #   List / Get / Create / Delete / Resume / Abort /
+│       │                            #   Archive / Rename / SetPermissionMode / SetModel /
+│       │                            #   ListSlashCommands / ListSkills
+│       ├── message_handler.go       # GET  /sessions/:id/messages（分页，支持 beforeSeq）
+│       │                            # POST /sessions/:id/messages（发消息，懒启动 Agent）
+│       ├── permission_handler.go    # POST /sessions/:id/permissions/:reqId/approve|deny（接口存根）
+│       ├── file_handler.go          # 会话工作目录的文件操作：
+│       │                            #   ListFiles（含关键词搜索）/ GetFile（base64）/
+│       │                            #   ListDirectory / UploadFile / DeleteUploadFile
+│       ├── git_handler.go           # 会话目录的 Git 查询：
+│       │                            #   GitStatus / GitDiffNumstat / GitDiffFile
+│       ├── machine_handler.go       # /machines：返回本机信息；/machines/:id/spawn 创建会话；
+│       │                            #   /machines/:id/paths/exists 检查路径是否存在
+│       ├── misc_handler.go          # POST /visibility（页面可见性心跳）
+│       └── sse_handler.go           # GET /api/events：SSE 长连接，支持 sessionId 过滤 / all=true 全订阅
+│
+└── web/                             # 前端（React + TypeScript + Vite + Tailwind）
+    ├── package.json
+    ├── vite.config.ts               # Vite 构建配置，开发时反代到 :8080
+    ├── tailwind.config.ts
+    ├── tsconfig.json
+    ├── vitest.config.ts             # Vitest 测试配置
+    │
+    └── src/
+        ├── main.tsx                 # React 入口，挂载 App
+        ├── App.tsx                  # 应用根组件，组装 Provider / Router
+        ├── router.tsx               # 路由定义（TanStack Router）
+        ├── index.css                # 全局样式
+        ├── sw.ts                    # Service Worker（PWA 支持）
+        │
+        ├── api/
+        │   └── client.ts            # REST API 封装：所有后端接口的 fetch 函数
+        │
+        ├── types/
+        │   ├── api.ts               # 后端 API 响应的 TypeScript 类型定义
+        │   ├── diff.d.ts            # diff 库类型声明
+        │   ├── global.d.ts          # 全局类型扩展
+        │   └── pwa.d.ts             # PWA 相关类型
+        │
+        ├── protocol/
+        │   ├── types.ts             # 前端内部协议类型（Message / Session / Agent 消息格式）
+        │   ├── messages.ts          # 消息内容的结构定义与类型守卫
+        │   ├── schemas.ts           # Zod schema 校验
+        │   ├── modes.ts             # 权限模式 / 模型模式枚举
+        │   ├── sessionSummary.ts    # SessionSummary 前端表示
+        │   ├── socket.ts            # SSE 连接管理（EventSource 封装、重连逻辑）
+        │   ├── utils.ts             # 协议工具函数
+        │   ├── version.ts           # 协议版本号
+        │   └── index.ts             # 统一导出
+        │
+        ├── chat/
+        │   ├── types.ts             # 聊天视图的内部类型（ChatMessage / ToolCall 等）
+        │   ├── normalize.ts         # 统一入口：将原始消息 normalize 为 ChatMessage
+        │   ├── normalizeAgent.ts    # Agent（assistant/codex/gemini）消息的 normalize 逻辑
+        │   ├── normalizeUser.ts     # 用户消息的 normalize 逻辑
+        │   ├── reducer.ts           # Chat 状态 reducer（消息列表增量更新）
+        │   ├── reducerCliOutput.ts  # CLI 输出类消息的 reducer 片段
+        │   ├── reducerEvents.ts     # 事件类消息（tool_use 等）的 reducer 片段
+        │   ├── reducerTimeline.ts   # 时间线排序 reducer 片段
+        │   ├── reducerTools.ts      # 工具调用 reducer 片段
+        │   ├── reconcile.ts         # 消息列表的增量对账（去重、排序）
+        │   ├── modelConfig.ts       # 各 Agent 支持的模型列表配置
+        │   ├── presentation.ts      # 消息展示层工具（文本提取、摘要）
+        │   └── tracer.ts            # 开发调试用消息追踪
+        │
+        ├── components/
+        │   ├── AssistantChat/       # 聊天主界面
+        │   │   ├── context.tsx      # Chat 页面 Context（session / messages / state）
+        │   │   ├── HappyThread.tsx  # 消息列表渲染（线程视图）
+        │   │   ├── HappyComposer.tsx# 输入框组件
+        │   │   ├── StatusBar.tsx    # 会话状态栏（thinking 状态、模型切换）
+        │   │   ├── ComposerButtons.tsx # 输入框功能按钮（发送、附件、slash 命令）
+        │   │   ├── AttachmentItem.tsx  # 附件预览项
+        │   │   └── messages/
+        │   │       ├── UserMessage.tsx      # 用户消息气泡
+        │   │       ├── AssistantMessage.tsx # AI 回复气泡（支持 Markdown）
+        │   │       ├── ToolMessage.tsx      # 工具调用消息
+        │   │       ├── SystemMessage.tsx    # 系统消息
+        │   │       ├── MessageAttachments.tsx # 消息附件展示
+        │   │       └── MessageStatusIndicator.tsx # 消息状态指示器
+        │   │
+        │   ├── ChatInput/
+        │   │   ├── Autocomplete.tsx # slash 命令 / 技能自动补全弹层
+        │   │   └── FloatingOverlay.tsx # 输入框浮层包装
+        │   │
+        │   ├── NewSession/          # 新建会话对话框
+        │   │   ├── index.tsx        # 新建会话主组件（目录 + Agent + Model + Yolo 等）
+        │   │   ├── AgentSelector.tsx# Agent 选择器（claude/codex/gemini/opencode）
+        │   │   ├── ModelSelector.tsx# 模型选择器
+        │   │   ├── DirectorySection.tsx # 工作目录选择
+        │   │   ├── MachineSelector.tsx  # 机器选择（目前只有本机）
+        │   │   ├── SessionTypeSelector.tsx # 会话类型选择器（UI 展示，后端不处理）
+        │   │   ├── YoloToggle.tsx   # Yolo 模式开关（跳过权限确认）
+        │   │   ├── ActionButtons.tsx# 确认/取消按钮
+        │   │   ├── preferences.ts   # 用户偏好持久化（localStorage）
+        │   │   ├── preferences.test.ts
+        │   │   └── types.ts
+        │   │
+        │   ├── ToolCard/            # 工具调用卡片展示
+        │   │   ├── ToolCard.tsx     # 工具卡片容器
+        │   │   ├── knownTools.tsx   # 已知工具的图标/名称映射
+        │   │   ├── PermissionFooter.tsx    # 权限审批操作区（approve/deny）
+        │   │   ├── AskUserQuestionFooter.tsx # 用户问答操作区
+        │   │   ├── RequestUserInputFooter.tsx # 用户输入操作区
+        │   │   ├── askUserQuestion.ts
+        │   │   ├── requestUserInput.ts
+        │   │   ├── icons.tsx
+        │   │   └── views/           # 各工具的自定义展示视图
+        │   │       ├── _all.tsx
+        │   │       └── _results.tsx
+        │   │
+        │   ├── SessionFiles/
+        │   │   └── DirectoryTree.tsx # 会话工作目录的树形文件浏览器
+        │   │
+        │   ├── Terminal/
+        │   │   └── TerminalView.tsx  # xterm.js 终端视图（CLI 输出展示）
+        │   │
+        │   ├── assistant-ui/        # Markdown 渲染 / 代码高亮（Shiki）相关组件
+        │   │   ├── markdown-text.tsx
+        │   │   ├── markdown-utils.ts
+        │   │   ├── reasoning.tsx    # 推理过程折叠展示
+        │   │   └── shiki-highlighter.tsx
+        │   │
+        │   ├── SessionList.tsx      # 左侧会话列表
+        │   ├── SessionChat.tsx      # 会话聊天页面顶层组件
+        │   ├── SessionHeader.tsx    # 会话顶栏（名称、操作菜单）
+        │   ├── SessionActionMenu.tsx# 会话操作下拉菜单（重命名/归档/删除）
+        │   ├── SpawnSession.tsx     # 通过 machine API 创建会话的组件
+        │   ├── MachineList.tsx      # 机器列表展示
+        │   ├── LoginPrompt.tsx      # 登录界面（accessToken 输入）
+        │   ├── LoginPrompt.test.tsx
+        │   ├── RenameSessionDialog.tsx # 重命名会话对话框
+        │   ├── CodeBlock.tsx        # 代码块（带复制按钮）
+        │   ├── CliOutputBlock.tsx   # CLI 输出块（monospace）
+        │   ├── DiffView.tsx         # 文件 diff 展示（git diff）
+        │   ├── MarkdownRenderer.tsx # 通用 Markdown 渲染器
+        │   ├── FileIcon.tsx         # 文件类型图标
+        │   ├── icons.tsx            # 通用图标库
+        │   ├── InstallPrompt.tsx    # PWA 安装提示
+        │   ├── LanguageSwitcher.tsx # 语言切换（中/英）
+        │   ├── LazyRainbowText.tsx  # 彩虹文字（装饰）
+        │   ├── LoadingState.tsx     # 加载状态占位
+        │   ├── OfflineBanner.tsx    # 离线状态横幅
+        │   ├── ReconnectingBanner.tsx # SSE 重连横幅
+        │   ├── SyncingBanner.tsx    # 数据同步中横幅
+        │   ├── Spinner.tsx          # 加载动画
+        │   └── ToastContainer.tsx   # 全局 Toast 通知容器
+        │
+        ├── routes/
+        │   ├── sessions/
+        │   │   ├── file.tsx         # 路由页面：单文件查看（base64 解码展示）
+        │   │   ├── files.tsx        # 路由页面：文件列表 / 目录树
+        │   │   └── terminal.tsx     # 路由页面：终端输出视图
+        │   └── settings/
+        │       ├── index.tsx        # 设置页面（主题、语言等）
+        │       └── index.test.tsx
+        │
+        ├── hooks/
+        │   ├── useCurrentSession.ts # 获取当前激活会话的 hook
+        │   ├── useMessages.ts       # 消息列表分页加载 hook（含 SSE 增量更新）
+        │   ├── useSession.ts        # 单会话数据 + SSE 监听
+        │   ├── useSessions.ts       # 会话列表 + SSE 监听
+        │   └── useVisibilityReporter.ts # 页面可见性上报 hook
+        │
+        ├── lib/
+        │   ├── app-context.tsx      # 全局 AppContext（token / user / SSE 连接状态）
+        │   ├── assistant-runtime.ts # assistant-ui 运行时适配层
+        │   ├── attachmentAdapter.ts # 附件上传适配
+        │   ├── clipboard.ts         # 剪贴板工具
+        │   ├── fileAttachments.ts   # 文件附件管理
+        │   ├── gitParsers.ts        # git status/diff 输出解析
+        │   ├── i18n-context.tsx     # 国际化 Context
+        │   ├── locales/
+        │   │   ├── en.ts            # 英文翻译
+        │   │   ├── zh-CN.ts         # 中文翻译
+        │   │   └── index.ts
+        │   ├── message-window-store.ts # 消息窗口状态（滚动位置等）
+        │   ├── messages.ts          # 消息工具函数
+        │   ├── query-client.ts      # TanStack Query 客户端实例
+        │   ├── query-keys.ts        # Query key 常量
+        │   ├── recent-skills.ts     # 最近使用的 skill 记录（localStorage）
+        │   ├── runtime-config.ts    # 运行时配置（API base URL 等）
+        │   ├── shiki.ts             # Shiki 代码高亮懒加载
+        │   ├── terminalFont.ts      # 终端字体加载
+        │   ├── toast-context.tsx    # Toast 通知 Context
+        │   ├── toolInputUtils.ts    # 工具调用输入解析工具
+        │   ├── use-translation.ts   # useTranslation hook
+        │   ├── agentFlavorUtils.ts  # Agent 类型工具（label / icon / 颜色）
+        │   └── utils.ts             # 通用工具函数（cn / clsx 等）
+        │
+        └── utils/
+            ├── applySuggestion.ts   # 将 slash 命令/自动补全建议应用到输入框
+            ├── findActiveWord.ts    # 查找光标处的活跃词（用于自动补全触发）
+            └── path.ts              # 路径工具函数
+```
+
+---
+
+## 六、API 路由一览
+
+### 公开路由
+| 方法   | 路径         | 说明                          |
+|--------|--------------|-------------------------------|
+| POST   | `/api/auth`  | accessToken 换取 JWT          |
+
+### 受保护路由（需 Bearer JWT）
+
+**会话**
+| 方法   | 路径                                      | 说明                       |
+|--------|-------------------------------------------|----------------------------|
+| GET    | `/api/sessions`                           | 列出所有会话               |
+| POST   | `/api/sessions`                           | 创建会话并启动 Agent       |
+| GET    | `/api/sessions/:id`                       | 获取会话详情               |
+| DELETE | `/api/sessions/:id`                       | 删除会话（需先归档）       |
+| PATCH  | `/api/sessions/:id`                       | 重命名会话                 |
+| POST   | `/api/sessions/:id/resume`                | 恢复会话（重新 Spawn）     |
+| POST   | `/api/sessions/:id/abort`                 | 中止 Agent 运行            |
+| POST   | `/api/sessions/:id/archive`               | 归档会话（停止 Agent）     |
+| POST   | `/api/sessions/:id/permission-mode`       | 设置权限模式               |
+| POST   | `/api/sessions/:id/model`                 | 切换模型                   |
+| GET    | `/api/sessions/:id/slash-commands`        | 列出 slash 命令            |
+| GET    | `/api/sessions/:id/skills`                | 列出 codex skills          |
+
+**消息**
+| 方法   | 路径                          | 说明                           |
+|--------|-------------------------------|--------------------------------|
+| GET    | `/api/sessions/:id/messages`  | 分页获取消息（支持 beforeSeq） |
+| POST   | `/api/sessions/:id/messages`  | 发送消息（懒启动 Agent）       |
+
+**权限审批**
+| 方法   | 路径                                               | 说明         |
+|--------|----------------------------------------------------|--------------|
+| POST   | `/api/sessions/:id/permissions/:reqId/approve`     | 批准权限请求 |
+| POST   | `/api/sessions/:id/permissions/:reqId/deny`        | 拒绝权限请求 |
+
+**文件**
+| 方法   | 路径                              | 说明                       |
+|--------|-----------------------------------|----------------------------|
+| GET    | `/api/sessions/:id/files`         | 搜索 / 列出文件            |
+| GET    | `/api/sessions/:id/file`          | 读取文件（base64）         |
+| GET    | `/api/sessions/:id/directory`     | 列出目录                   |
+| POST   | `/api/sessions/:id/upload`        | 上传文件（base64，≤50MB）  |
+| POST   | `/api/sessions/:id/upload/delete` | 删除已上传文件             |
+
+**Git**
+| 方法   | 路径                                   | 说明              |
+|--------|----------------------------------------|-------------------|
+| GET    | `/api/sessions/:id/git-status`         | git status        |
+| GET    | `/api/sessions/:id/git-diff-numstat`   | git diff numstat  |
+| GET    | `/api/sessions/:id/git-diff-file`      | 单文件 diff       |
+
+**机器 / 其他**
+| 方法   | 路径                              | 说明                    |
+|--------|-----------------------------------|-------------------------|
+| GET    | `/api/machines`                   | 列出本机信息            |
+| POST   | `/api/machines/:id/spawn`         | 在指定机器创建会话      |
+| POST   | `/api/machines/:id/paths/exists`  | 检查路径是否存在        |
+| POST   | `/api/visibility`                 | 页面可见性心跳          |
+| GET    | `/api/events`                     | SSE 实时事件流          |
+
+---
+
+## 七、核心数据模型
+
+### Session（会话）
+```
+Session {
+  id, createdAt, updatedAt, active, activeAt
+  metadata: { path(工作目录), flavor(agent类型), name, host, worktree }
+  agentState: { requests(待审批权限请求), completedRequests }
+  permissionMode, modelMode, thinking
+}
+```
+
+### Message（消息）
+```
+Message {
+  id, sessionId, seq(自增序号), createdAt
+  content: JSON RawMessage
+    - claude:   {"type":"assistant","content":[...]}
+    - codex:    {"role":"agent","content":{"type":"codex","data":{...}}}
+    - 用户消息:  {"role":"user","content":{"type":"text","text":"..."}}
+}
+```
+
+### CreateSessionRequest
+```
+CreateSessionRequest {
+  directory string  // 工作目录（必填）
+  agent     string  // claude | codex | gemini | opencode（默认 claude）
+  model     string  // 指定模型（可选）
+  yolo      bool    // 跳过权限确认
+}
+```
+
+### SyncEvent（SSE 推送事件）
+```
+SyncEvent {
+  type: "session-added" | "session-updated" | "session-removed" | "message-received"
+  sessionId: string
+  message?: Message   // 仅 message-received 时附带
+}
+```
+
+---
+
+## 八、消息的记录与展示
+
+### 8.1 统一存储：SQLite messages 表
+
+无论哪种 Agent，消息最终都经由 `emitMessage()` → `Store.InsertMessage()` 写入同一张 SQLite 表：
+
+```sql
+messages (
+  id          TEXT PRIMARY KEY,
+  session_id  TEXT,
+  seq         INTEGER,   -- 会话内自增序号，用于分页
+  content_json TEXT,     -- 各 Agent 原始 JSON，格式不同
+  created_at  INTEGER    -- Unix 毫秒时间戳
+)
+```
+
+### 8.2 各 Agent 的消息捕获方式
+
+| Agent | 捕获方式 | 用户消息写入 |
+|-------|----------|-------------|
+| **claude** | stdout pipe → 逐行解析 stream-json | claude 输出中自带 `type:user`，直接存储 |
+| **codex** | stdout pipe → 解析 `item.completed` 事件 | codex 不回显用户消息，由 hapi-lite 在发送前**显式写入** |
+| **gemini** | GeminiScanner tail `~/.gemini/sessions/*.jsonl` | 从 JSONL 文件读取，含 `type:user` 行 |
+| **opencode** | OpencodeScanner tail `~/.opencode/sessions/*.jsonl` | 从 JSONL 文件读取，含 `type:user` 行 |
+
+### 8.3 content_json 格式差异
+
+**claude**（stream-json 原始行）：
+```json
+{"type": "user",      "content": [{"type": "text", "text": "你好"}]}
+{"type": "assistant", "content": [{"type": "text", "text": "你好！"}]}
+{"type": "summary",   "summary": "...", "leafUuid": "..."}
+```
+
+**codex**（hapi-lite 包装后）：
+```json
+// 用户消息（hapi-lite 主动写入）
+{"role": "user",  "content": {"type": "text", "text": "你好"}}
+
+// Agent 回复
+{"role": "agent", "content": {"type": "codex", "data": {"type": "message",  "message": "你好！", "id": "..."}}}
+{"role": "agent", "content": {"type": "codex", "data": {"type": "reasoning", "message": "...",   "id": "..."}}}
+{"role": "agent", "content": {"type": "codex", "data": {"type": "tool-call", "name": "Bash", "callId": "...", "input": {...}, "id": "..."}}}
+{"role": "agent", "content": {"type": "codex", "data": {"type": "tool-call-result", "callId": "...", "output": "...", "id": "..."}}}
+```
+
+**gemini / opencode**（JSONL 文件原始行，与 claude 格式接近）：
+```json
+{"type": "user",      "content": {...}}
+{"type": "assistant", "content": [...]}
+```
+
+### 8.4 实时推送链路
+
+```
+emitMessage()
+  │
+  ├── onMessage(sessionID, msg)
+  │     └── Store.InsertMessage()   → 持久化到 SQLite
+  │
+  └── onEvent(sessionID, SyncEvent{Type: "message-received", Message: &msg})
+        └── Broker.Publish()        → 推送给所有 SSE 订阅者
+```
+
+前端通过 EventSource 收到 `message-received` 事件后，将消息追加到本地 TanStack Query 缓存，无需重新请求接口。
+
+### 8.5 消息查询与分页
+
+`GET /api/sessions/:id/messages?limit=50&beforeSeq=<seq>`
+
+- 按 `seq DESC` 倒序查询，再反转为升序返回（最新消息在最后）
+- `beforeSeq` 实现向上翻页（加载更早消息），类似 IM 的"上拉加载更多"
+- 返回结构：
+
+```json
+{
+  "messages": [...],
+  "page": {
+    "limit": 50,
+    "beforeSeq": null,
+    "nextBeforeSeq": 12,
+    "hasMore": true
+  }
+}
+```
+
+---
+
+## 九、关键技术依赖
+
+| 层       | 技术栈                                                                                          |
+|----------|-------------------------------------------------------------------------------------------------|
+| Go 后端  | Gin（HTTP）、go-sqlite3（存储）、golang-jwt（鉴权）、uuid                                       |
+| 前端     | React 18、TypeScript、Vite、TanStack Router、TanStack Query、Tailwind CSS、Shiki、xterm.js      |
+| 实时通信 | SSE（Server-Sent Events），前端 EventSource                                                      |
+| 持久化   | SQLite（WAL 模式），单文件                                                                       |
+| Agent    | claude CLI、codex CLI、gemini CLI、opencode CLI（需系统已安装）                                  |

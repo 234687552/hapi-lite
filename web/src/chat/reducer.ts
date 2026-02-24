@@ -88,20 +88,48 @@ export function reduceChatBlocks(
         }
     }
 
-    // Calculate latest usage from messages (find the most recent message with usage data)
-    let latestUsage: LatestUsage | null = null
+    // Calculate cumulative usage for current turn
+    // Find the last user message to determine the start of current turn
+    let lastUserMsgIndex = -1
     for (let i = normalized.length - 1; i >= 0; i--) {
+        if (normalized[i].role === 'user') {
+            lastUserMsgIndex = i
+            break
+        }
+    }
+
+    // Accumulate tokens from all messages after the last user message
+    let latestUsage: LatestUsage | null = null
+    let totalInput = 0
+    let totalOutput = 0
+    let totalCacheCreation = 0
+    let totalCacheRead = 0
+    let lastContextSize = 0
+    let lastTimestamp = 0
+
+    // Start from the message after the last user message, or from the beginning if no user message
+    const startIndex = lastUserMsgIndex >= 0 ? lastUserMsgIndex + 1 : 0
+
+    for (let i = startIndex; i < normalized.length; i++) {
         const msg = normalized[i]
         if (msg.usage) {
-            latestUsage = {
-                inputTokens: msg.usage.input_tokens,
-                outputTokens: msg.usage.output_tokens,
-                cacheCreation: msg.usage.cache_creation_input_tokens ?? 0,
-                cacheRead: msg.usage.cache_read_input_tokens ?? 0,
-                contextSize: calculateContextSize(msg.usage),
-                timestamp: msg.createdAt
-            }
-            break
+            totalInput += msg.usage.input_tokens
+            totalOutput += msg.usage.output_tokens
+            totalCacheCreation += msg.usage.cache_creation_input_tokens ?? 0
+            totalCacheRead += msg.usage.cache_read_input_tokens ?? 0
+            lastContextSize = calculateContextSize(msg.usage)
+            lastTimestamp = msg.createdAt
+        }
+    }
+
+    if (totalInput > 0 || totalOutput > 0) {
+        latestUsage = {
+            inputTokens: totalInput,
+            outputTokens: totalOutput,
+            cacheCreation: totalCacheCreation,
+            cacheRead: totalCacheRead,
+            contextSize: lastContextSize,
+            timestamp: lastTimestamp
         }
     }
 

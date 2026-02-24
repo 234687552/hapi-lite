@@ -2,12 +2,14 @@ package session
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,7 +21,6 @@ type Manager struct {
 	agents    map[string]*AgentProcess
 	onEvent   func(sessionID string, event SyncEvent)
 	onMessage func(sessionID string, msg Message)
-	onExit    func(sessionID string)
 }
 
 type AgentProcess struct {
@@ -28,15 +29,16 @@ type AgentProcess struct {
 	Scanner   scanner.Scanner
 	HasSent   bool
 	Running   bool
+	RunningAt int64
 	seq       int64
+	cancel    context.CancelFunc
 }
 
-func NewManager(onEvent func(string, SyncEvent), onMessage func(string, Message), onExit func(string)) *Manager {
+func NewManager(onEvent func(string, SyncEvent), onMessage func(string, Message)) *Manager {
 	return &Manager{
 		agents:    make(map[string]*AgentProcess),
 		onEvent:   onEvent,
 		onMessage: onMessage,
-		onExit:    onExit,
 	}
 }
 
@@ -48,7 +50,7 @@ func (m *Manager) SpawnAgent(sessionID string, req CreateSessionRequest, startSe
 		startSeq = 0
 	}
 
-	proc := &AgentProcess{SessionID: sessionID, Req: req, seq: startSeq}
+	proc := &AgentProcess{SessionID: sessionID, Req: req, seq: startSeq, HasSent: startSeq > 0}
 
 	// Gemini/OpenCode still use file-based scanners.
 	// Codex uses `codex exec --json` parsing in-process.
@@ -59,9 +61,9 @@ func (m *Manager) SpawnAgent(sessionID string, req CreateSessionRequest, startSe
 		var sc scanner.Scanner
 		switch req.Agent {
 		case "gemini":
-			sc = scanner.NewGeminiScanner(msgCb, nil)
+			sc = scanner.NewGeminiScanner(msgCb)
 		case "opencode":
-			sc = scanner.NewOpencodeScanner(msgCb, nil)
+			sc = scanner.NewOpencodeScanner(msgCb)
 		}
 		proc.Scanner = sc
 		if sc != nil {
@@ -96,57 +98,107 @@ func (m *Manager) HasAgent(sessionID string) bool {
 	return ok
 }
 
-func (m *Manager) AbortAgent(sessionID string) { m.StopAgent(sessionID) }
-
-func (m *Manager) SendMessage(sessionID string, text string) error {
+func (m *Manager) AbortAgent(sessionID string) {
 	m.mu.RLock()
 	proc, ok := m.agents[sessionID]
 	m.mu.RUnlock()
+	if ok && proc.cancel != nil {
+		proc.cancel()
+	}
+}
+
+func (m *Manager) IsRunning(sessionID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	proc, ok := m.agents[sessionID]
 	if !ok {
+		return false
+	}
+	return proc.Running
+}
+
+func (m *Manager) RunningAt(sessionID string) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	proc, ok := m.agents[sessionID]
+	if !ok {
+		return 0
+	}
+	return proc.RunningAt
+}
+
+func (m *Manager) SendMessage(sessionID string, text string) error {
+	m.mu.Lock()
+	proc, ok := m.agents[sessionID]
+	if !ok {
+		m.mu.Unlock()
 		return fmt.Errorf("no active agent for session %s", sessionID)
 	}
 	if proc.Running {
-		return fmt.Errorf("agent is busy")
+		m.mu.Unlock()
+		return fmt.Errorf("agent is busy, please wait for the current message to complete")
+	}
+
+	// 拦截 /clear：重置 HasSent，下次发消息开新 session，不发给 claude
+	if strings.TrimSpace(text) == "/clear" {
+		proc.HasSent = false
+		m.mu.Unlock()
+		m.emitMessage(sessionID, proc, buildAssistantTextMessage("Context was reset"), time.Now().UnixMilli())
+		if m.onEvent != nil {
+			m.onEvent(sessionID, SyncEvent{Type: "session-updated", SessionID: sessionID})
+		}
+		return nil
 	}
 
 	isContinue := proc.HasSent
 	proc.HasSent = true
 	proc.Running = true
+	proc.RunningAt = time.Now().UnixMilli()
+	ctx, cancel := context.WithCancel(context.Background())
+	proc.cancel = cancel
+	m.mu.Unlock()
 
-	if proc.Req.Agent == "codex" {
-		// codex exec output does not emit user prompts, so persist it explicitly.
-		raw := buildRoleWrappedMessage("user", map[string]interface{}{
-			"type": "text",
-			"text": text,
-		})
-		m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
+	// Always persist user prompts to database for all agent types
+	raw := buildRoleWrappedMessage("user", map[string]interface{}{
+		"type": "text",
+		"text": text,
+	})
+	m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
+
+	if m.onEvent != nil {
+		m.onEvent(sessionID, SyncEvent{Type: "session-updated", SessionID: sessionID})
 	}
 
-	go m.runOnce(sessionID, proc, text, isContinue)
+	go m.runOnce(ctx, cancel, sessionID, proc, text, isContinue)
 	return nil
 }
 
-func (m *Manager) runOnce(sessionID string, proc *AgentProcess, text string, isContinue bool) {
+func (m *Manager) runOnce(ctx context.Context, cancel context.CancelFunc, sessionID string, proc *AgentProcess, text string, isContinue bool) {
 	defer func() {
+		cancel()
+		m.mu.Lock()
 		proc.Running = false
+		proc.RunningAt = 0
+		proc.cancel = nil
+		m.mu.Unlock()
 		if m.onEvent != nil {
 			m.onEvent(sessionID, SyncEvent{Type: "session-updated", SessionID: sessionID})
 		}
 	}()
 
 	req := proc.Req
-	cmd := m.buildCmd(req, text, isContinue)
+	cmd := m.buildCmd(ctx, sessionID, req, text, isContinue)
 	if cmd == nil {
 		return
 	}
 
 	// For claude: capture stdout to parse stream-json
 	if req.Agent == "claude" {
-		m.runClaude(cmd, sessionID, proc)
+		m.runClaude(ctx, cmd, sessionID, proc)
 		return
 	}
 	if req.Agent == "codex" {
-		m.runCodex(cmd, sessionID, proc)
+		m.runCodex(ctx, cmd, sessionID, proc)
 		return
 	}
 
@@ -158,12 +210,12 @@ func (m *Manager) runOnce(sessionID string, proc *AgentProcess, text string, isC
 		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to start %s: %v", req.Agent, err)), time.Now().UnixMilli())
 		return
 	}
-	if err := cmd.Wait(); err != nil {
+	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
 		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("%s exited with error: %v", req.Agent, err)), time.Now().UnixMilli())
 	}
 }
 
-func (m *Manager) buildCmd(req CreateSessionRequest, text string, isContinue bool) *exec.Cmd {
+func (m *Manager) buildCmd(ctx context.Context, sessionID string, req CreateSessionRequest, text string, isContinue bool) *exec.Cmd {
 	var cmd *exec.Cmd
 	switch req.Agent {
 	case "claude":
@@ -175,10 +227,12 @@ func (m *Manager) buildCmd(req CreateSessionRequest, text string, isContinue boo
 			args = append(args, "--model", req.Model)
 		}
 		if isContinue {
-			args = append(args, "--continue")
+			args = append(args, "--resume", sessionID)
+		} else {
+			args = append(args, "--session-id", sessionID)
 		}
 		args = append(args, text)
-		cmd = exec.Command("claude", args...)
+		cmd = exec.CommandContext(ctx, "claude", args...)
 	case "codex":
 		args := []string{"exec", "--json", "--skip-git-repo-check"}
 		if req.Yolo {
@@ -188,11 +242,11 @@ func (m *Manager) buildCmd(req CreateSessionRequest, text string, isContinue boo
 			args = append(args, "--model", req.Model)
 		}
 		args = append(args, text)
-		cmd = exec.Command("codex", args...)
+		cmd = exec.CommandContext(ctx, "codex", args...)
 	case "gemini":
-		cmd = exec.Command("gemini", text)
+		cmd = exec.CommandContext(ctx, "gemini", text)
 	case "opencode":
-		cmd = exec.Command("opencode", text)
+		cmd = exec.CommandContext(ctx, "opencode", text)
 	default:
 		return nil
 	}
@@ -206,21 +260,46 @@ func (m *Manager) buildCmd(req CreateSessionRequest, text string, isContinue boo
 		env = append(env, e)
 	}
 	cmd.Env = append(env, "TERM=dumb")
+	// 设置新进程组，abort 时可以杀整个进程树（包括孙进程）
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	return cmd
 }
 
-func (m *Manager) runClaude(cmd *exec.Cmd, sessionID string, proc *AgentProcess) {
+func (m *Manager) runClaude(ctx context.Context, cmd *exec.Cmd, sessionID string, proc *AgentProcess) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "stdout pipe error: %v\n", err)
+		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to initialize Claude output: %v", err)), time.Now().UnixMilli())
 		return
 	}
-	cmd.Stderr = os.Stderr
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stderr pipe error: %v\n", err)
+		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to initialize Claude error output: %v", err)), time.Now().UnixMilli())
+		return
+	}
 
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "spawn error: %v\n", err)
+		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to start Claude: %v", err)), time.Now().UnixMilli())
 		return
 	}
+
+	// Capture stderr in a goroutine
+	var stderrBuf strings.Builder
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			fmt.Fprintf(os.Stderr, "Claude stderr: %s\n", line)
+			stderrBuf.WriteString(line)
+			stderrBuf.WriteString("\n")
+		}
+	}()
 
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -245,9 +324,20 @@ func (m *Manager) runClaude(cmd *exec.Cmd, sessionID string, proc *AgentProcess)
 	}
 
 	cmd.Wait()
+	wg.Wait() // Wait for stderr goroutine to finish
+
+	// abort 时不上报错误
+	if ctx.Err() != nil {
+		return
+	}
+
+	// If there were stderr messages, send them to the frontend
+	if stderrOutput := strings.TrimSpace(stderrBuf.String()); stderrOutput != "" {
+		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("⚠️ Claude Error:\n%s", stderrOutput)), time.Now().UnixMilli())
+	}
 }
 
-func (m *Manager) runCodex(cmd *exec.Cmd, sessionID string, proc *AgentProcess) {
+func (m *Manager) runCodex(ctx context.Context, cmd *exec.Cmd, sessionID string, proc *AgentProcess) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "stdout pipe error: %v\n", err)
@@ -359,9 +449,9 @@ func (m *Manager) runCodex(cmd *exec.Cmd, sessionID string, proc *AgentProcess) 
 		}
 	}
 
-	if err := cmd.Wait(); err != nil {
+	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
 		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("codex exited with error: %v", err)), time.Now().UnixMilli())
-	} else if !emitted {
+	} else if !emitted && ctx.Err() == nil {
 		m.emitMessage(sessionID, proc, buildAssistantTextMessage("codex finished without response content"), time.Now().UnixMilli())
 	}
 }
@@ -431,6 +521,3 @@ func parseMaybeJSONValue(v interface{}) interface{} {
 
 func (m *Manager) SetPermissionMode(sessionID string, mode string) {}
 func (m *Manager) SetModelMode(sessionID string, model string)     {}
-func (m *Manager) ApprovePermission(sessionID, requestID, decision string, answers interface{}) {
-}
-func (m *Manager) DenyPermission(sessionID, requestID string) {}

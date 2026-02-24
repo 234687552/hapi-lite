@@ -15,6 +15,25 @@ type SessionHandler struct {
 	*BaseHandler
 }
 
+func (h *SessionHandler) hydrateRuntimeState(sess *session.Session) {
+	if sess == nil || h.Mgr == nil {
+		return
+	}
+
+	if h.Mgr.IsRunning(sess.ID) {
+		sess.Thinking = true
+		if startedAt := h.Mgr.RunningAt(sess.ID); startedAt > 0 {
+			sess.ThinkingAt = startedAt
+		} else if sess.ThinkingAt <= 0 {
+			sess.ThinkingAt = sess.UpdatedAt
+		}
+		return
+	}
+
+	sess.Thinking = false
+	sess.ThinkingAt = 0
+}
+
 func toSummary(sess session.Session) session.SessionSummary {
 	var meta *session.SessionSummaryMetadata
 	if sess.Metadata != nil {
@@ -54,6 +73,7 @@ func (h *SessionHandler) List(c *gin.Context) {
 	}
 	summaries := make([]session.SessionSummary, 0, len(sessions))
 	for _, sess := range sessions {
+		h.hydrateRuntimeState(&sess)
 		summaries = append(summaries, toSummary(sess))
 	}
 	c.JSON(http.StatusOK, gin.H{"sessions": summaries})
@@ -70,6 +90,7 @@ func (h *SessionHandler) Get(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Session not found"})
 		return
 	}
+	h.hydrateRuntimeState(sess)
 	c.JSON(http.StatusOK, gin.H{"session": sess})
 }
 
@@ -134,7 +155,6 @@ func (h *SessionHandler) Abort(c *gin.Context) {
 	if h.Mgr != nil {
 		h.Mgr.AbortAgent(id)
 	}
-	_ = h.Store.SetSessionActive(id, false)
 	h.Broker.Publish(session.SyncEvent{
 		Type: "session-updated", SessionID: id,
 	})
@@ -240,11 +260,6 @@ func (h *SessionHandler) Archive(c *gin.Context) {
 	h.Broker.Publish(session.SyncEvent{
 		Type: "session-updated", SessionID: id,
 	})
-	c.JSON(http.StatusOK, gin.H{"ok": true})
-}
-
-func (h *SessionHandler) Switch(c *gin.Context) {
-	// Lite does not differentiate local/remote session modes.
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

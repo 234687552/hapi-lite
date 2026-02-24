@@ -25,7 +25,6 @@ func SetupRouter(st *store.Store, broker *sse.Broker, mgr *session.Manager) *gin
 
 	api := r.Group("/api")
 	api.POST("/auth", AuthHandler)
-	api.POST("/bind", BindHandler)
 
 	protected := api.Group("")
 	protected.Use(auth.Middleware())
@@ -40,7 +39,6 @@ func SetupRouter(st *store.Store, broker *sse.Broker, mgr *session.Manager) *gin
 	protected.POST("/sessions/:id/resume", sh.Resume)
 	protected.POST("/sessions/:id/abort", sh.Abort)
 	protected.POST("/sessions/:id/archive", sh.Archive)
-	protected.POST("/sessions/:id/switch", sh.Switch)
 	protected.POST("/sessions/:id/permission-mode", sh.SetPermissionMode)
 	protected.POST("/sessions/:id/model", sh.SetModel)
 	protected.PATCH("/sessions/:id", sh.Rename)
@@ -74,9 +72,6 @@ func SetupRouter(st *store.Store, broker *sse.Broker, mgr *session.Manager) *gin
 
 	miscH := &MiscHandler{}
 	protected.POST("/visibility", miscH.Visibility)
-	protected.GET("/push/vapid-public-key", miscH.PushVapidPublicKey)
-	protected.POST("/push/subscribe", miscH.PushSubscribe)
-	protected.DELETE("/push/subscribe", miscH.PushUnsubscribe)
 
 	sseH := &SSEHandler{Broker: broker}
 	protected.GET("/events", sseH.Events)

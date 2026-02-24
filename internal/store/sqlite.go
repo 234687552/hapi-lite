@@ -179,13 +179,6 @@ func (s *Store) DeleteSession(id string) error {
 	return tx.Commit()
 }
 
-func (s *Store) UpdateSessionState(id string, state *session.AgentState) error {
-	stateJSON, _ := json.Marshal(state)
-	_, err := s.db.Exec(`UPDATE sessions SET agent_state_json = ?, updated_at = ? WHERE id = ?`,
-		string(stateJSON), time.Now().UnixMilli(), id)
-	return err
-}
-
 func (s *Store) UpdateSessionMeta(id string, meta *session.Metadata) error {
 	metaJSON, _ := json.Marshal(meta)
 	_, err := s.db.Exec(`UPDATE sessions SET metadata_json = ?, updated_at = ? WHERE id = ?`,

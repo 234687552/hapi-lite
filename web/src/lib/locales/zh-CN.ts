@@ -245,6 +245,8 @@ export default {
   'misc.typeAMessage': '输入消息...',
   'misc.offline': '离线',
   'misc.permissionRequired': '需要权限',
+  'misc.tokens': 'tokens',
+  'misc.thoughtFor': '思考 {duration}',
   'misc.percentLeft': '剩余 {percent}%',
   'misc.online': '在线',
 } as const

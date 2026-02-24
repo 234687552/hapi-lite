@@ -55,9 +55,6 @@ func main() {
 		func(sid string, msg session.Message) {
 			st.InsertMessage(msg)
 		},
-		func(sid string) {
-			st.SetSessionActive(sid, false)
-		},
 	)
 
 	resetStaleActiveSessions(st)

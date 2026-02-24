@@ -2,7 +2,7 @@ package scanner
 
 import "encoding/json"
 
-// Scanner watches agent session files and emits messages
+// Scanner watches agent session files and emits messages.
 type Scanner interface {
 	Start(sessionID string, agentSessionID string, dir string) error
 	Stop()
@@ -17,4 +17,3 @@ type ScannedMessage struct {
 }
 
 type MessageCallback func(sessionID string, msg ScannedMessage)
-type StateCallback func(sessionID string, state json.RawMessage)

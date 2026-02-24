@@ -10,26 +10,24 @@ type GeminiScanner struct {
 	sessionID string
 	stopCh    chan struct{}
 	onMessage MessageCallback
-	onState   StateCallback
 }
 
-func NewGeminiScanner(onMsg MessageCallback, onState StateCallback) *GeminiScanner {
+func NewGeminiScanner(onMsg MessageCallback) *GeminiScanner {
 	return &GeminiScanner{
 		stopCh:    make(chan struct{}),
 		onMessage: onMsg,
-		onState:   onState,
 	}
 }
 
 func (s *GeminiScanner) Start(sessionID, agentSessionID, dir string) error {
 	s.sessionID = sessionID
-	go s.watch(agentSessionID)
+	go s.watch()
 	return nil
 }
 
 func (s *GeminiScanner) Stop() { close(s.stopCh) }
 
-func (s *GeminiScanner) watch(agentSessionID string) {
+func (s *GeminiScanner) watch() {
 	home, _ := os.UserHomeDir()
 	baseDir := filepath.Join(home, ".gemini", "sessions")
 

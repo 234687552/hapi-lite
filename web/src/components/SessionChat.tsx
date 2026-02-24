@@ -222,13 +222,18 @@ export function SessionChat(props: {
                         active={props.session.active}
                         allowSendWhenInactive
                         thinking={props.session.thinking}
+                        activeAt={props.session.activeAt}
+                        thinkingAt={props.session.thinkingAt}
                         agentState={props.session.agentState}
                         contextSize={reduced.latestUsage?.contextSize}
+                        inputTokens={reduced.latestUsage?.inputTokens}
+                        outputTokens={reduced.latestUsage?.outputTokens}
                         controlledByUser={props.session.agentState?.controlledByUser === true}
                         onPermissionModeChange={handlePermissionModeChange}
                         onModelModeChange={handleModelModeChange}
                         onSwitchToRemote={handleSwitchToRemote}
                         onTerminal={props.session.active ? handleViewTerminal : undefined}
+                        onDirectSend={(text) => handleSend(text)}
                         autocompleteSuggestions={props.autocompleteSuggestions}
                     />
                 </div>

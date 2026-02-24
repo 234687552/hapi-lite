@@ -84,9 +84,13 @@ export function useSendMessage(
             updateMessageStatus(input.sessionId, input.localId, 'sent')
             haptic.notification('success')
         },
-        onError: (_, input) => {
+        onError: (error, input) => {
             updateMessageStatus(input.sessionId, input.localId, 'failed')
             haptic.notification('error')
+
+            // Log error details for debugging
+            const errorMessage = error instanceof Error ? error.message : String(error)
+            console.error('Failed to send message:', errorMessage)
         },
     })
 
@@ -105,6 +109,7 @@ export function useSendMessage(
             options?.onBlocked?.('pending')
             return
         }
+
         const localId = makeClientSideId('local')
         const createdAt = Date.now()
         void (async () => {

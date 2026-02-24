@@ -10,14 +10,12 @@ type OpencodeScanner struct {
 	sessionID string
 	stopCh    chan struct{}
 	onMessage MessageCallback
-	onState   StateCallback
 }
 
-func NewOpencodeScanner(onMsg MessageCallback, onState StateCallback) *OpencodeScanner {
+func NewOpencodeScanner(onMsg MessageCallback) *OpencodeScanner {
 	return &OpencodeScanner{
 		stopCh:    make(chan struct{}),
 		onMessage: onMsg,
-		onState:   onState,
 	}
 }
 

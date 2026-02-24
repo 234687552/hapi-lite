@@ -9,7 +9,7 @@ function withMessageState(message: DecryptedMessage, normalized: NormalizedMessa
     return { ...normalized, status: message.status, originalText: message.originalText }
 }
 
-function normalizeSdkAssistantRecord(message: DecryptedMessage, content: unknown, meta?: unknown): NormalizedMessage | null {
+function normalizeSdkAssistantRecord(message: DecryptedMessage, content: unknown, usage?: unknown, meta?: unknown): NormalizedMessage | null {
     return normalizeAgentRecord(
         message.id,
         message.localId,
@@ -19,7 +19,8 @@ function normalizeSdkAssistantRecord(message: DecryptedMessage, content: unknown
             data: {
                 type: 'assistant',
                 message: {
-                    content
+                    content,
+                    usage
                 }
             }
         },
@@ -88,7 +89,7 @@ export function normalizeDecryptedMessage(message: DecryptedMessage): Normalized
         }
     }
     if (record.role === 'assistant') {
-        const normalized = normalizeSdkAssistantRecord(message, record.content, record.meta)
+        const normalized = normalizeSdkAssistantRecord(message, record.content, record.usage, record.meta)
         return normalized
             ? withMessageState(message, normalized)
             : {

@@ -1,11 +1,6 @@
 import type { Machine } from '@/types/api'
 import { useTranslation } from '@/lib/use-translation'
-
-function getMachineTitle(machine: Machine): string {
-    if (machine.metadata?.displayName) return machine.metadata.displayName
-    if (machine.metadata?.host) return machine.metadata.host
-    return machine.id.slice(0, 8)
-}
+import { getMachineTitle } from '@/lib/session-utils'
 
 export function MachineSelector(props: {
     machines: Machine[]

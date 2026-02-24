@@ -11,13 +11,6 @@ const (
 	FlavorOpencode AgentFlavor = "opencode"
 )
 
-type SessionType string
-
-const (
-	SessionTypeSimple   SessionType = "simple"
-	SessionTypeWorktree SessionType = "worktree"
-)
-
 type AgentStateRequest struct {
 	Tool      string      `json:"tool"`
 	Arguments interface{} `json:"arguments"`
@@ -126,12 +119,10 @@ type SessionSummary struct {
 }
 
 type CreateSessionRequest struct {
-	Directory    string `json:"directory" binding:"required"`
-	Agent        string `json:"agent"`
-	Model        string `json:"model,omitempty"`
-	Yolo         bool   `json:"yolo,omitempty"`
-	SessionType  string `json:"sessionType,omitempty"`
-	WorktreeName string `json:"worktreeName,omitempty"`
+	Directory string `json:"directory" binding:"required"`
+	Agent     string `json:"agent"`
+	Model     string `json:"model,omitempty"`
+	Yolo      bool   `json:"yolo,omitempty"`
 }
 
 type SendMessageRequest struct {
