@@ -1,0 +1,10 @@
+hapi-lite
+hapi-lite.db
+*.db-journal
+*.db-wal
+*.db-shm
+config.yaml
+web/node_modules/
+web/dist/
+tmp/
+.serena/
