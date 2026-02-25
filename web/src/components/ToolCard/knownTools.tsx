@@ -223,7 +223,7 @@ export const knownTools: Record<string, {
             const mode = getInputStringAny(opts.input, ['edit_mode'])
             return mode ? `mode: ${mode}` : null
         },
-        minimal: false
+        minimal: true
     },
     TodoWrite: {
         icon: () => <BulbIcon className={DEFAULT_ICON_CLASS} />,
@@ -235,13 +235,7 @@ export const knownTools: Record<string, {
             if (newTodos && newTodos.length > 0) return `${newTodos.length} items`
             return null
         },
-        minimal: (opts) => {
-            const todos = isObject(opts.input) && Array.isArray(opts.input.todos) ? opts.input.todos : null
-            if (todos && todos.length > 0) return false
-            const newTodos = isObject(opts.result) && Array.isArray(opts.result.newTodos) ? opts.result.newTodos : null
-            if (newTodos && newTodos.length > 0) return false
-            return true
-        }
+        minimal: true
     },
     CodexReasoning: {
         icon: () => <BulbIcon className={DEFAULT_ICON_CLASS} />,
@@ -288,12 +282,12 @@ export const knownTools: Record<string, {
     ExitPlanMode: {
         icon: () => <ClipboardIcon className={DEFAULT_ICON_CLASS} />,
         title: () => 'Plan proposal',
-        minimal: false
+        minimal: true
     },
     exit_plan_mode: {
         icon: () => <ClipboardIcon className={DEFAULT_ICON_CLASS} />,
         title: () => 'Plan proposal',
-        minimal: false
+        minimal: true
     },
     AskUserQuestion: {
         icon: () => <QuestionIcon className={DEFAULT_ICON_CLASS} />,

@@ -12,16 +12,17 @@ export default defineConfig({
         __APP_VERSION__: JSON.stringify(require('./package.json').version),
     },
     server: {
+        port: 5703,
         host: true,
         allowedHosts: true,
         cors: true,
         proxy: {
             '/api': {
-                target: 'http://127.0.0.1:8080',
+                target: 'http://127.0.0.1:3009',
                 changeOrigin: true
             },
             '/socket.io': {
-                target: 'http://127.0.0.1:8080',
+                target: 'http://127.0.0.1:3009',
                 ws: true
             }
         }
@@ -35,8 +36,8 @@ export default defineConfig({
             srcDir: 'src',
             filename: 'sw.ts',
             manifest: {
-                name: 'HAPI',
-                short_name: 'HAPI',
+                name: 'HAPI-LITE',
+                short_name: 'HAPI-LITE',
                 description: 'AI-powered development assistant',
                 theme_color: '#ffffff',
                 background_color: '#ffffff',

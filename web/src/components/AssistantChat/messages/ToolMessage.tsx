@@ -1,9 +1,8 @@
 import type { ToolCallMessagePartProps } from '@assistant-ui/react'
 import type { ChatBlock } from '@/chat/types'
 import type { ToolCallBlock } from '@/chat/types'
-import { isObject, safeStringify } from '@hapi/protocol'
+import { isObject } from '@hapi/protocol'
 import { getEventPresentation } from '@/chat/presentation'
-import { CodeBlock } from '@/components/CodeBlock'
 import { MarkdownRenderer } from '@/components/MarkdownRenderer'
 import { LazyRainbowText } from '@/components/LazyRainbowText'
 import { MessageStatusIndicator } from '@/components/AssistantChat/messages/MessageStatusIndicator'
@@ -15,13 +14,13 @@ function isToolCallBlock(value: unknown): value is ToolCallBlock {
     if (!isObject(value)) return false
     if (value.kind !== 'tool-call') return false
     if (typeof value.id !== 'string') return false
-    if (value.localId !== null && typeof value.localId !== 'string') return false
+    if (value.localId != null && typeof value.localId !== 'string') return false
     if (typeof value.createdAt !== 'number') return false
     if (!Array.isArray(value.children)) return false
     if (!isObject(value.tool)) return false
     if (typeof value.tool.name !== 'string') return false
     if (!('input' in value.tool)) return false
-    if (value.tool.description !== null && typeof value.tool.description !== 'string') return false
+    if (value.tool.description != null && typeof value.tool.description !== 'string') return false
     if (value.tool.state !== 'pending' && value.tool.state !== 'running' && value.tool.state !== 'completed' && value.tool.state !== 'error') return false
     return true
 }
@@ -162,37 +161,28 @@ export function HappyToolMessage(props: ToolCallMessagePartProps) {
     const artifact = props.artifact
 
     if (!isToolCallBlock(artifact)) {
-        const argsText = typeof props.argsText === 'string' ? props.argsText.trim() : ''
-        const hasArgsText = argsText.length > 0
-        const hasResult = props.result !== undefined
-        const resultText = hasResult ? safeStringify(props.result) : ''
-
+        const isRunning = props.status.type === 'running' && props.result === undefined
         return (
             <div className="py-1 min-w-0 max-w-full overflow-x-hidden">
-                <div className="rounded-xl bg-[var(--app-secondary-bg)] p-3 shadow-sm">
+                <div className="rounded-xl bg-[var(--app-secondary-bg)] px-3 py-2 shadow-sm">
                     <div className="flex items-center gap-2 text-xs">
                         <div className="font-mono text-[var(--app-hint)]">
-                            Tool: {props.toolName}
+                            {props.toolName}
                         </div>
                         {props.isError ? (
                             <span className="text-red-500">Error</span>
-                        ) : null}
-                        {props.status.type === 'running' && !hasResult ? (
-                            <span className="text-[var(--app-hint)]">Running…</span>
-                        ) : null}
+                        ) : isRunning ? (
+                            <svg className="h-3 w-3 animate-spin text-[var(--app-hint)]" viewBox="0 0 24 24" fill="none">
+                                <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2.5" opacity="0.25" />
+                                <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" opacity="0.75" />
+                            </svg>
+                        ) : (
+                            <svg className="h-3 w-3 text-emerald-600" viewBox="0 0 16 16" fill="none">
+                                <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.5" />
+                                <path d="M5.2 8.3l1.8 1.8 3.8-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                        )}
                     </div>
-
-                    {hasArgsText ? (
-                        <div className="mt-2">
-                            <CodeBlock code={argsText} language="json" />
-                        </div>
-                    ) : null}
-
-                    {hasResult ? (
-                        <div className="mt-2">
-                            <CodeBlock code={resultText} language={typeof props.result === 'string' ? 'text' : 'json'} />
-                        </div>
-                    ) : null}
                 </div>
             </div>
         )
