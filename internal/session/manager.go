@@ -24,14 +24,15 @@ type Manager struct {
 }
 
 type AgentProcess struct {
-	SessionID string
-	Req       CreateSessionRequest
-	Scanner   scanner.Scanner
-	HasSent   bool
-	Running   bool
-	RunningAt int64
-	seq       int64
-	cancel    context.CancelFunc
+	SessionID      string
+	Req            CreateSessionRequest
+	Scanner        scanner.Scanner
+	HasSent        bool
+	Running        bool
+	RunningAt      int64
+	seq            int64
+	cancel         context.CancelFunc
+	CodexThreadID  string
 }
 
 func NewManager(onEvent func(string, SyncEvent), onMessage func(string, Message)) *Manager {
@@ -234,14 +235,30 @@ func (m *Manager) buildCmd(ctx context.Context, sessionID string, req CreateSess
 		args = append(args, text)
 		cmd = exec.CommandContext(ctx, "claude", args...)
 	case "codex":
-		args := []string{"exec", "--json", "--skip-git-repo-check"}
-		if req.Yolo {
-			args = append(args, "--full-auto")
+		m.mu.RLock()
+		codexThreadID := m.agents[sessionID].CodexThreadID
+		m.mu.RUnlock()
+
+		var args []string
+		if isContinue && codexThreadID != "" {
+			args = []string{"exec", "resume", "--json", "--skip-git-repo-check"}
+			if req.Yolo {
+				args = append(args, "--full-auto")
+			}
+			if req.Model != "" && req.Model != "default" {
+				args = append(args, "--model", req.Model)
+			}
+			args = append(args, codexThreadID, text)
+		} else {
+			args = []string{"exec", "--json", "--skip-git-repo-check"}
+			if req.Yolo {
+				args = append(args, "--full-auto")
+			}
+			if req.Model != "" && req.Model != "default" {
+				args = append(args, "--model", req.Model)
+			}
+			args = append(args, text)
 		}
-		if req.Model != "" && req.Model != "default" {
-			args = append(args, "--model", req.Model)
-		}
-		args = append(args, text)
 		cmd = exec.CommandContext(ctx, "codex", args...)
 	case "gemini":
 		cmd = exec.CommandContext(ctx, "gemini", text)
@@ -368,6 +385,17 @@ func (m *Manager) runCodex(ctx context.Context, cmd *exec.Cmd, sessionID string,
 		}
 
 		eventType := asStringValue(event["type"])
+
+		// 捕获 thread_id 用于后续 resume
+		if eventType == "thread.started" {
+			if threadID := asStringValue(event["thread_id"]); threadID != "" {
+				m.mu.Lock()
+				proc.CodexThreadID = threadID
+				m.mu.Unlock()
+			}
+			continue
+		}
+
 		if eventType != "item.completed" {
 			continue
 		}
