@@ -426,7 +426,66 @@ func (m *Manager) runCodex(ctx context.Context, cmd *exec.Cmd, sessionID string,
 			})
 			m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
 			emitted = true
-		case "tool_result", "tool-call-result", "function_call_output":
+		case "web_search":
+			callID := firstStringValue(item["id"], item["call_id"], item["callId"])
+			if callID == "" {
+				continue
+			}
+			query := asStringValue(item["query"])
+			action, _ := item["action"].(map[string]interface{})
+			url := ""
+			if action != nil {
+				url = asStringValue(action["url"])
+			}
+			input := map[string]interface{}{"query": query}
+			if url != "" {
+				input["url"] = url
+			}
+			toolName := "WebSearch"
+			if url != "" && query == url {
+				toolName = "WebFetch"
+				input = map[string]interface{}{"url": url}
+			}
+			// web_search 即完成，直接发一条已完成的 tool-call（带 result），避免分页截断导致 running 卡住
+			raw := buildRoleWrappedMessage("agent", map[string]interface{}{
+				"type": "codex",
+				"data": map[string]interface{}{
+					"type":   "tool-call",
+					"name":   toolName,
+					"callId": callID,
+					"input":  input,
+					"result": "done",
+					"id":     uuid.New().String(),
+				},
+			})
+			m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
+			emitted = true
+		case "command_execution":
+		cmdStr := strings.TrimRight(asStringValue(item["command"]), "\r\n")
+		if cmdStr == "" {
+			continue
+		}
+		callID := firstStringValue(item["id"], item["call_id"])
+		if callID == "" {
+			callID = uuid.New().String()
+		}
+		output := strings.TrimRight(asStringValue(item["aggregated_output"]), "\r\n")
+		exitCode := item["exit_code"]
+		raw := buildRoleWrappedMessage("agent", map[string]interface{}{
+			"type": "codex",
+			"data": map[string]interface{}{
+				"type":     "tool-call",
+				"name":     "Shell",
+				"callId":   callID,
+				"input":    map[string]interface{}{"command": cmdStr},
+				"result":   output,
+				"exitCode": exitCode,
+				"id":       uuid.New().String(),
+			},
+		})
+		m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
+		emitted = true
+	case "tool_result", "tool-call-result", "function_call_output":
 			callID := firstStringValue(item["call_id"], item["callId"], item["tool_call_id"], item["toolCallId"], item["id"])
 			if callID == "" {
 				continue

@@ -326,21 +326,35 @@ export function normalizeAgentRecord(
 
         if (data.type === 'tool-call' && typeof data.callId === 'string') {
             const uuid = asString(data.id) ?? messageId
+            const content: NormalizedAgentContent[] = [{
+                type: 'tool-call',
+                id: data.callId,
+                name: asString(data.name) ?? 'unknown',
+                input: data.input,
+                description: null,
+                uuid,
+                parentUUID: null
+            }]
+            // 如果后端在同一条消息里附带了 result，直接追加 tool-result，让 block 以 completed 状态创建
+            if ('result' in data) {
+                const exitCode = 'exitCode' in data ? data.exitCode : null
+                const isError = exitCode !== null && exitCode !== undefined && exitCode !== 0
+                content.push({
+                    type: 'tool-result',
+                    tool_use_id: data.callId as string,
+                    content: data.result,
+                    is_error: isError,
+                    uuid,
+                    parentUUID: null
+                })
+            }
             return {
                 id: messageId,
                 localId,
                 createdAt,
                 role: 'agent',
                 isSidechain: false,
-                content: [{
-                    type: 'tool-call',
-                    id: data.callId,
-                    name: asString(data.name) ?? 'unknown',
-                    input: data.input,
-                    description: null,
-                    uuid,
-                    parentUUID: null
-                }],
+                content,
                 meta
             }
         }
