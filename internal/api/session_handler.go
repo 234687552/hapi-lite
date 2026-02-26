@@ -241,7 +241,16 @@ func (h *SessionHandler) Resume(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": countErr.Error()})
 			return
 		}
-		h.Mgr.SpawnAgent(id, req, startSeq)
+		agentSID := ""
+		if sess.Metadata != nil {
+			switch flavor {
+			case "claude":
+				agentSID = sess.Metadata.ClaudeSessionID
+			case "codex":
+				agentSID = sess.Metadata.CodexSessionID
+			}
+		}
+		h.Mgr.SpawnAgentWithSession(id, req, startSeq, agentSID)
 	}
 	_ = h.Store.SetSessionActive(id, true)
 	h.Broker.Publish(session.SyncEvent{

@@ -17,41 +17,44 @@ import (
 )
 
 type Manager struct {
-	mu        sync.RWMutex
-	agents    map[string]*AgentProcess
-	onEvent   func(sessionID string, event SyncEvent)
-	onMessage func(sessionID string, msg Message)
+	mu              sync.RWMutex
+	agents          map[string]*AgentProcess
+	onEvent         func(sessionID string, event SyncEvent)
+	onMessage       func(sessionID string, msg Message)
+	onUpdateAgentSessId func(sessionID, agentSessionID, agent string) // 持久化 agentSessionID 到 DB
 }
 
 type AgentProcess struct {
-	SessionID      string
+	AgentSessionID      string
 	Req            CreateSessionRequest
 	Scanner        scanner.Scanner
-	HasSent        bool
 	Running        bool
 	RunningAt      int64
 	seq            int64
 	cancel         context.CancelFunc
-	CodexThreadID  string
 }
 
-func NewManager(onEvent func(string, SyncEvent), onMessage func(string, Message)) *Manager {
+func NewManager(onEvent func(string, SyncEvent), onMessage func(string, Message), onUpdateAgentSessId func(string, string, string)) *Manager {
 	return &Manager{
-		agents:    make(map[string]*AgentProcess),
-		onEvent:   onEvent,
-		onMessage: onMessage,
+		agents:              make(map[string]*AgentProcess),
+		onEvent:             onEvent,
+		onMessage:           onMessage,
+		onUpdateAgentSessId: onUpdateAgentSessId,
 	}
 }
 
 func (m *Manager) SpawnAgent(sessionID string, req CreateSessionRequest, startSeq int64) {
+	m.SpawnAgentWithSession(sessionID, req, startSeq, "")
+}
+
+func (m *Manager) SpawnAgentWithSession(sessionID string, req CreateSessionRequest, startSeq int64, agentSessionID string) {
 	if req.Agent == "" {
 		req.Agent = "claude"
 	}
 	if startSeq < 0 {
 		startSeq = 0
 	}
-
-	proc := &AgentProcess{SessionID: sessionID, Req: req, seq: startSeq, HasSent: startSeq > 0}
+	proc := &AgentProcess{Req: req, seq: startSeq, AgentSessionID: agentSessionID}
 
 	// Gemini/OpenCode still use file-based scanners.
 	// Codex uses `codex exec --json` parsing in-process.
@@ -83,6 +86,9 @@ func (m *Manager) StopAgent(sessionID string) {
 	m.mu.RUnlock()
 	if !ok {
 		return
+	}
+	if proc.cancel != nil {
+		proc.cancel()
 	}
 	if proc.Scanner != nil {
 		proc.Scanner.Stop()
@@ -140,19 +146,20 @@ func (m *Manager) SendMessage(sessionID string, text string) error {
 		return fmt.Errorf("agent is busy, please wait for the current message to complete")
 	}
 
-	// 拦截 /clear：重置 HasSent，下次发消息开新 session，不发给 claude
+	// 拦截 /clear：清空 AgentSessionID，下次发消息开新 agent session
 	if strings.TrimSpace(text) == "/clear" {
-		proc.HasSent = false
+		proc.AgentSessionID = ""
 		m.mu.Unlock()
-		m.emitMessage(sessionID, proc, buildAssistantTextMessage("Context was reset"), time.Now().UnixMilli())
+		if m.onUpdateAgentSessId != nil {
+			m.onUpdateAgentSessId(sessionID, "", proc.Req.Agent)
+		}
+		m.emitMessage(sessionID, proc, buildEventMessage("message", map[string]interface{}{"type": "message", "message": "Context was reset"}), time.Now().UnixMilli())
 		if m.onEvent != nil {
 			m.onEvent(sessionID, SyncEvent{Type: "session-updated", SessionID: sessionID})
 		}
 		return nil
 	}
 
-	isContinue := proc.HasSent
-	proc.HasSent = true
 	proc.Running = true
 	proc.RunningAt = time.Now().UnixMilli()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -170,11 +177,11 @@ func (m *Manager) SendMessage(sessionID string, text string) error {
 		m.onEvent(sessionID, SyncEvent{Type: "session-updated", SessionID: sessionID})
 	}
 
-	go m.runOnce(ctx, cancel, sessionID, proc, text, isContinue)
+	go m.runOnce(ctx, cancel, sessionID, proc, text)
 	return nil
 }
 
-func (m *Manager) runOnce(ctx context.Context, cancel context.CancelFunc, sessionID string, proc *AgentProcess, text string, isContinue bool) {
+func (m *Manager) runOnce(ctx context.Context, cancel context.CancelFunc, sessionID string, proc *AgentProcess, text string) {
 	defer func() {
 		cancel()
 		m.mu.Lock()
@@ -188,7 +195,7 @@ func (m *Manager) runOnce(ctx context.Context, cancel context.CancelFunc, sessio
 	}()
 
 	req := proc.Req
-	cmd := m.buildCmd(ctx, sessionID, req, text, isContinue)
+	cmd := m.buildCmd(ctx, sessionID, req, text)
 	if cmd == nil {
 		return
 	}
@@ -216,7 +223,11 @@ func (m *Manager) runOnce(ctx context.Context, cancel context.CancelFunc, sessio
 	}
 }
 
-func (m *Manager) buildCmd(ctx context.Context, sessionID string, req CreateSessionRequest, text string, isContinue bool) *exec.Cmd {
+func (m *Manager) buildCmd(ctx context.Context, sessionID string, req CreateSessionRequest, text string) *exec.Cmd {
+	m.mu.RLock()
+	agentSessionID := m.agents[sessionID].AgentSessionID
+	m.mu.RUnlock()
+
 	var cmd *exec.Cmd
 	switch req.Agent {
 	case "claude":
@@ -227,20 +238,23 @@ func (m *Manager) buildCmd(ctx context.Context, sessionID string, req CreateSess
 		if req.Model != "" && req.Model != "default" {
 			args = append(args, "--model", req.Model)
 		}
-		if isContinue {
-			args = append(args, "--resume", sessionID)
+		if agentSessionID != "" {
+			args = append(args, "--resume", agentSessionID)
 		} else {
-			args = append(args, "--session-id", sessionID)
+			agentSessionID = uuid.New().String()
+			m.mu.Lock()
+			m.agents[sessionID].AgentSessionID = agentSessionID
+			m.mu.Unlock()
+			if m.onUpdateAgentSessId != nil {
+				m.onUpdateAgentSessId(sessionID, agentSessionID, "claude")
+			}
+			args = append(args, "--session-id", agentSessionID)
 		}
 		args = append(args, text)
 		cmd = exec.CommandContext(ctx, "claude", args...)
 	case "codex":
-		m.mu.RLock()
-		codexThreadID := m.agents[sessionID].CodexThreadID
-		m.mu.RUnlock()
-
 		var args []string
-		if isContinue && codexThreadID != "" {
+		if agentSessionID != "" {
 			args = []string{"exec", "resume", "--json", "--skip-git-repo-check"}
 			if req.Yolo {
 				args = append(args, "--full-auto")
@@ -248,7 +262,7 @@ func (m *Manager) buildCmd(ctx context.Context, sessionID string, req CreateSess
 			if req.Model != "" && req.Model != "default" {
 				args = append(args, "--model", req.Model)
 			}
-			args = append(args, codexThreadID, text)
+			args = append(args, agentSessionID, text)
 		} else {
 			args = []string{"exec", "--json", "--skip-git-repo-check"}
 			if req.Yolo {
@@ -388,10 +402,13 @@ func (m *Manager) runCodex(ctx context.Context, cmd *exec.Cmd, sessionID string,
 
 		// 捕获 thread_id 用于后续 resume
 		if eventType == "thread.started" {
-			if threadID := asStringValue(event["thread_id"]); threadID != "" {
+			if threadID := asStringValue(event["thread_id"]); threadID != "" && proc.AgentSessionID == "" {
 				m.mu.Lock()
-				proc.CodexThreadID = threadID
+				proc.AgentSessionID = threadID
 				m.mu.Unlock()
+				if m.onUpdateAgentSessId != nil {
+					m.onUpdateAgentSessId(sessionID, threadID, "codex")
+				}
 			}
 			continue
 		}
@@ -572,6 +589,14 @@ func buildRoleWrappedMessage(role string, content interface{}) json.RawMessage {
 
 func buildAssistantTextMessage(text string) json.RawMessage {
 	return buildRoleWrappedMessage("assistant", text)
+}
+
+func buildEventMessage(_ string, data interface{}) json.RawMessage {
+	b, _ := json.Marshal(map[string]interface{}{
+		"role":    "agent",
+		"content": map[string]interface{}{"type": "event", "data": data},
+	})
+	return json.RawMessage(b)
 }
 
 func asStringValue(v interface{}) string {

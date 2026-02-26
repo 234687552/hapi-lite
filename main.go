@@ -55,6 +55,24 @@ func main() {
 		func(sid string, msg session.Message) {
 			st.InsertMessage(msg)
 		},
+		// 持久化 agentSessionID 到 DB
+		func(sid, agentSID, agent string) {
+			sess, err := st.GetSession(sid)
+			if err != nil || sess == nil {
+				return
+			}
+			meta := sess.Metadata
+			if meta == nil {
+				meta = &session.Metadata{}
+			}
+			switch agent {
+			case "claude":
+				meta.ClaudeSessionID = agentSID
+			case "codex":
+				meta.CodexSessionID = agentSID
+			}
+			st.UpdateSessionMeta(sid, meta)
+		},
 	)
 
 	resetStaleActiveSessions(st)
