@@ -68,9 +68,13 @@ func (s *Store) CreateSession(req session.CreateSessionRequest) (*session.Sessio
 	}
 	metaJSON, _ := json.Marshal(meta)
 
+	var perm sql.NullString
+	if req.Yolo {
+		perm = sql.NullString{String: "yolo", Valid: true}
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO sessions (id, agent, directory, active, created_at, updated_at, metadata_json, model_mode) VALUES (?, ?, ?, 1, ?, ?, ?, ?)`,
-		id, agent, req.Directory, now, now, string(metaJSON), req.Model,
+		`INSERT INTO sessions (id, agent, directory, active, created_at, updated_at, metadata_json, model_mode, permission_mode) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)`,
+		id, agent, req.Directory, now, now, string(metaJSON), req.Model, perm,
 	)
 	if err != nil {
 		return nil, err

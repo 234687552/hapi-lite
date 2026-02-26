@@ -45,7 +45,14 @@ export function useSessionActions(
             }
             await api.archiveSession(sessionId)
         },
-        onSuccess: () => void invalidateSession(),
+        onSuccess: () => {
+            if (sessionId) {
+                queryClient.setQueryData(queryKeys.session(sessionId), (old: { active?: boolean } | undefined) =>
+                    old ? { ...old, active: false } : old
+                )
+            }
+            void invalidateSession()
+        },
     })
 
     const switchMutation = useMutation({

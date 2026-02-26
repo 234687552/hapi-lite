@@ -506,30 +506,30 @@ func (m *Manager) runCodex(ctx context.Context, cmd *exec.Cmd, sessionID string,
 			m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
 			emitted = true
 		case "command_execution":
-		cmdStr := strings.TrimRight(asStringValue(item["command"]), "\r\n")
-		if cmdStr == "" {
-			continue
-		}
-		callID := firstStringValue(item["id"], item["call_id"])
-		if callID == "" {
-			callID = uuid.New().String()
-		}
-		output := strings.TrimRight(asStringValue(item["aggregated_output"]), "\r\n")
-		exitCode := item["exit_code"]
-		raw := buildRoleWrappedMessage("agent", map[string]interface{}{
-			"type": "codex",
-			"data": map[string]interface{}{
-				"type":     "tool-call",
-				"name":     "Shell",
-				"callId":   callID,
-				"input":    map[string]interface{}{"command": cmdStr},
-				"result":   output,
-				"exitCode": exitCode,
-				"id":       uuid.New().String(),
-			},
-		})
-		m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
-		emitted = true
+			cmdStr := strings.TrimRight(asStringValue(item["command"]), "\r\n")
+			if cmdStr == "" {
+				continue
+			}
+			callID := firstStringValue(item["id"], item["call_id"])
+			if callID == "" {
+				callID = uuid.New().String()
+			}
+			output := strings.TrimRight(asStringValue(item["aggregated_output"]), "\r\n")
+			exitCode := item["exit_code"]
+			raw := buildRoleWrappedMessage("agent", map[string]interface{}{
+				"type": "codex",
+				"data": map[string]interface{}{
+					"type":     "tool-call",
+					"name":     "Shell",
+					"callId":   callID,
+					"input":    map[string]interface{}{"command": cmdStr},
+					"result":   output,
+					"exitCode": exitCode,
+					"id":       uuid.New().String(),
+				},
+			})
+			m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
+			emitted = true
 	case "tool_result", "tool-call-result", "function_call_output":
 			callID := firstStringValue(item["call_id"], item["callId"], item["tool_call_id"], item["toolCallId"], item["id"])
 			if callID == "" {
