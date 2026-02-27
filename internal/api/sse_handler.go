@@ -24,7 +24,7 @@ func (h *SSEHandler) Events(c *gin.Context) {
 	client := &sse.Client{
 		ID:        clientID,
 		SessionID: sessionID,
-		Events:    make(chan string, 64),
+		Events:    make(chan string, 256),
 	}
 	h.Broker.Subscribe(client)
 	defer h.Broker.Unsubscribe(clientID)

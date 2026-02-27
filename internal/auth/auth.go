@@ -34,7 +34,7 @@ func Middleware() gin.HandlerFunc {
 		if auth != "" && strings.HasPrefix(auth, "Bearer ") {
 			tokenStr = strings.TrimPrefix(auth, "Bearer ")
 		}
-		if tokenStr == "" && c.Request.URL.Path == "/api/events" {
+		if tokenStr == "" && strings.HasSuffix(c.Request.URL.Path, "/api/events") {
 			tokenStr = c.Query("token")
 		}
 		if tokenStr == "" {

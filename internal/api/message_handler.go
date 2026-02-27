@@ -123,11 +123,20 @@ func (h *MessageHandler) Send(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": countErr.Error()})
 				return
 			}
-			h.Mgr.SpawnAgent(sessionID, session.CreateSessionRequest{
+			agentSID := ""
+			if sess.Metadata != nil {
+				switch flavor {
+				case "claude":
+					agentSID = sess.Metadata.ClaudeSessionID
+				case "codex":
+					agentSID = sess.Metadata.CodexSessionID
+				}
+			}
+			h.Mgr.SpawnAgentWithSession(sessionID, session.CreateSessionRequest{
 				Directory: dir,
 				Agent:     flavor,
 				Model:     sess.ModelMode,
-			}, startSeq)
+			}, startSeq, agentSID)
 			_ = h.Store.SetSessionActive(sessionID, true)
 			if h.Broker != nil {
 				h.Broker.Publish(session.SyncEvent{
