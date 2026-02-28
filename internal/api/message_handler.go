@@ -150,5 +150,18 @@ func (h *MessageHandler) Send(c *gin.Context) {
 			return
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	runtime := gin.H{
+		"active":     true,
+		"thinking":   false,
+		"thinkingAt": int64(0),
+	}
+	if h.Mgr != nil {
+		runtime["active"] = h.Mgr.HasAgent(sessionID)
+		runtime["thinking"] = h.Mgr.IsRunning(sessionID)
+		runtime["thinkingAt"] = h.Mgr.RunningAt(sessionID)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"runtime": runtime,
+	})
 }

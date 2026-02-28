@@ -42,15 +42,22 @@ func (b *Broker) Publish(event session.SyncEvent) {
 	data, _ := json.Marshal(event)
 	msg := fmt.Sprintf("data: %s\n\n", data)
 
+	overflowClients := make([]string, 0)
 	b.mu.RLock()
-	defer b.mu.RUnlock()
-
 	for _, c := range b.clients {
 		if c.SessionID == "" || c.SessionID == event.SessionID {
 			select {
 			case c.Events <- msg:
-			default: // drop if full
+			default:
+				overflowClients = append(overflowClients, c.ID)
 			}
 		}
+	}
+	b.mu.RUnlock()
+
+	// When a client cannot keep up, close that subscription so the frontend reconnects
+	// and performs catch-up fetches instead of silently missing messages forever.
+	for _, id := range overflowClients {
+		b.Unsubscribe(id)
 	}
 }

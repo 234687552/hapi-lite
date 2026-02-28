@@ -17,15 +17,15 @@ import (
 )
 
 type Manager struct {
-	mu              sync.RWMutex
-	agents          map[string]*AgentProcess
-	onEvent         func(sessionID string, event SyncEvent)
-	onMessage       func(sessionID string, msg Message)
+	mu                  sync.RWMutex
+	agents              map[string]*AgentProcess
+	onEvent             func(sessionID string, event SyncEvent)
+	onMessage           func(sessionID string, msg Message)
 	onUpdateAgentSessId func(sessionID, agentSessionID, agent string) // 持久化 agentSessionID 到 DB
 }
 
 type AgentProcess struct {
-	AgentSessionID      string
+	AgentSessionID string
 	Req            CreateSessionRequest
 	Scanner        scanner.Scanner
 	Running        bool
@@ -231,7 +231,9 @@ func (m *Manager) buildCmd(ctx context.Context, sessionID string, req CreateSess
 	var cmd *exec.Cmd
 	switch req.Agent {
 	case "claude":
-		args := []string{"--print", "--output-format", "stream-json"}
+		// `--verbose` is required for stable stream-json event coverage
+		// (including thinking-related assistant blocks in newer Claude CLI versions).
+		args := []string{"--print", "--verbose", "--output-format", "stream-json"}
 		if req.Yolo {
 			args = append(args, "--dangerously-skip-permissions")
 		}
@@ -316,6 +318,8 @@ func (m *Manager) runClaude(ctx context.Context, cmd *exec.Cmd, sessionID string
 		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to start Claude: %v", err)), time.Now().UnixMilli())
 		return
 	}
+	stopKill := hookCancelKillProcessGroup(ctx, cmd)
+	defer stopKill()
 
 	// Capture stderr in a goroutine
 	var stderrBuf strings.Builder
@@ -382,6 +386,8 @@ func (m *Manager) runCodex(ctx context.Context, cmd *exec.Cmd, sessionID string,
 		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to start codex: %v", err)), time.Now().UnixMilli())
 		return
 	}
+	stopKill := hookCancelKillProcessGroup(ctx, cmd)
+	defer stopKill()
 
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 128*1024), 8*1024*1024)
@@ -530,7 +536,7 @@ func (m *Manager) runCodex(ctx context.Context, cmd *exec.Cmd, sessionID string,
 			})
 			m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
 			emitted = true
-	case "tool_result", "tool-call-result", "function_call_output":
+		case "tool_result", "tool-call-result", "function_call_output":
 			callID := firstStringValue(item["call_id"], item["callId"], item["tool_call_id"], item["toolCallId"], item["id"])
 			if callID == "" {
 				continue
@@ -597,6 +603,33 @@ func buildEventMessage(_ string, data interface{}) json.RawMessage {
 		"content": map[string]interface{}{"type": "event", "data": data},
 	})
 	return json.RawMessage(b)
+}
+
+func hookCancelKillProcessGroup(ctx context.Context, cmd *exec.Cmd) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			killProcessGroup(cmd)
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
+}
+
+func killProcessGroup(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err == nil && pgid > 0 {
+		if killErr := syscall.Kill(-pgid, syscall.SIGKILL); killErr == nil || killErr == syscall.ESRCH {
+			return
+		}
+	}
+
+	_ = cmd.Process.Kill()
 }
 
 func asStringValue(v interface{}) string {

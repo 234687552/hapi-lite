@@ -11,6 +11,7 @@ import type {
     MessagesResponse,
     ModelMode,
     PermissionMode,
+    SendMessageResponse,
     PushSubscriptionPayload,
     PushUnsubscribePayload,
     PushVapidPublicKeyResponse,
@@ -274,8 +275,8 @@ export class ApiClient {
         return response.sessionId
     }
 
-    async sendMessage(sessionId: string, text: string, localId?: string | null, attachments?: AttachmentMetadata[]): Promise<void> {
-        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    async sendMessage(sessionId: string, text: string, localId?: string | null, attachments?: AttachmentMetadata[]): Promise<SendMessageResponse> {
+        return await this.request<SendMessageResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
             method: 'POST',
             body: JSON.stringify({
                 text,

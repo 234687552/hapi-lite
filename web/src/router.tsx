@@ -156,7 +156,33 @@ function SessionPage() {
                 return currentSessionId
             }
             try {
-                return await api.resumeSession(currentSessionId)
+                const resumedSessionId = await api.resumeSession(currentSessionId)
+                const resumedAt = Date.now()
+
+                // Optimistically flip local session state so status bar updates immediately
+                // even if SSE session-updated is delayed or temporarily disconnected.
+                queryClient.setQueryData(
+                    queryKeys.session(currentSessionId),
+                    (old: { session?: { active?: boolean; activeAt?: number; thinking?: boolean; thinkingAt?: number } } | undefined) => {
+                        if (!old?.session) {
+                            return old
+                        }
+                        return {
+                            ...old,
+                            session: {
+                                ...old.session,
+                                active: true,
+                                activeAt: resumedAt,
+                                thinking: true,
+                                thinkingAt: resumedAt
+                            }
+                        }
+                    }
+                )
+                void queryClient.invalidateQueries({ queryKey: queryKeys.session(currentSessionId) })
+                void queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
+
+                return resumedSessionId
             } catch (error) {
                 const message = error instanceof Error ? error.message : 'Resume failed'
                 addToast({
@@ -174,7 +200,13 @@ function SessionPage() {
                     if (session && resolvedSessionId !== session.id) {
                         seedMessageWindowFromSession(session.id, resolvedSessionId)
                         queryClient.setQueryData(queryKeys.session(resolvedSessionId), {
-                            session: { ...session, id: resolvedSessionId, active: true }
+                            session: {
+                                ...session,
+                                id: resolvedSessionId,
+                                active: true,
+                                thinking: true,
+                                thinkingAt: Date.now()
+                            }
                         })
                     }
                     try {
@@ -194,6 +226,28 @@ function SessionPage() {
                     replace: true
                 })
             })()
+        },
+        onSent: (targetSessionId, response) => {
+            const runtime = response.runtime
+            if (runtime) {
+                queryClient.setQueryData(
+                    queryKeys.session(targetSessionId),
+                    (old: { session?: { active?: boolean; thinking?: boolean; thinkingAt?: number } } | undefined) => {
+                        if (!old?.session) {
+                            return old
+                        }
+                        return {
+                            ...old,
+                            session: {
+                                ...old.session,
+                                active: runtime.active,
+                                thinking: runtime.thinking,
+                                thinkingAt: runtime.thinking ? (runtime.thinkingAt > 0 ? runtime.thinkingAt : Date.now()) : 0
+                            }
+                        }
+                    }
+                )
+            }
         },
         onBlocked: (reason) => {
             if (reason === 'no-api') {

@@ -214,10 +214,7 @@ function AppInner() {
     }, [api, queryClient, selectedSessionId, startSync, endSync])
 
     const handleSseDisconnect = useCallback(() => {
-        // Only show reconnecting banner if we've already connected once
-        if (!isFirstConnectRef.current) {
-            setSseDisconnected(true)
-        }
+        setSseDisconnected(true)
     }, [])
 
     const handleSseEvent = useCallback(() => {}, [])
@@ -247,6 +244,22 @@ function AppInner() {
         onEvent: handleSseEvent,
         onToast: handleToast
     })
+
+    // Fallback polling while SSE is disconnected so chat still updates without manual refresh.
+    useEffect(() => {
+        if (!sseDisconnected || !api || !selectedSessionId) {
+            return
+        }
+
+        const refresh = () => {
+            void queryClient.invalidateQueries({ queryKey: queryKeys.session(selectedSessionId) })
+            void fetchLatestMessages(api, selectedSessionId)
+        }
+
+        refresh()
+        const timer = window.setInterval(refresh, 2_500)
+        return () => window.clearInterval(timer)
+    }, [api, queryClient, selectedSessionId, sseDisconnected])
 
     useVisibilityReporter({
         api,

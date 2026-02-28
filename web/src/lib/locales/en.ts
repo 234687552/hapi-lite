@@ -247,4 +247,6 @@ export default {
   'misc.thoughtFor': 'thought for {duration}',
   'misc.percentLeft': '{percent}% left',
   'misc.online': 'online',
+  'misc.sending': 'sending',
+  'misc.stopping': 'stopping',
 } as const

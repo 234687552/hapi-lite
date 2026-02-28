@@ -222,7 +222,6 @@ export function SessionChat(props: {
                         active={props.session.active}
                         allowSendWhenInactive
                         thinking={props.session.thinking}
-                        activeAt={props.session.activeAt}
                         thinkingAt={props.session.thinkingAt}
                         agentState={props.session.agentState}
                         contextSize={reduced.latestUsage?.contextSize}

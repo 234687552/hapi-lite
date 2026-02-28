@@ -249,4 +249,6 @@ export default {
   'misc.thoughtFor': '思考 {duration}',
   'misc.percentLeft': '剩余 {percent}%',
   'misc.online': '在线',
+  'misc.sending': '发送中',
+  'misc.stopping': '停止中',
 } as const

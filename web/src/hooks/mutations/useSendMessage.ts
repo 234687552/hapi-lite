@@ -1,7 +1,7 @@
 import { useMutation } from '@tanstack/react-query'
 import { useRef, useState } from 'react'
 import type { ApiClient } from '@/api/client'
-import type { AttachmentMetadata, DecryptedMessage } from '@/types/api'
+import type { AttachmentMetadata, DecryptedMessage, SendMessageResponse } from '@/types/api'
 import { makeClientSideId } from '@/lib/messages'
 import {
     appendOptimisticMessage,
@@ -24,6 +24,8 @@ type UseSendMessageOptions = {
     resolveSessionId?: (sessionId: string) => Promise<string>
     onSessionResolved?: (sessionId: string) => void
     onBlocked?: (reason: BlockedReason) => void
+    onSent?: (sessionId: string, response: SendMessageResponse) => void
+    onSendFailed?: (sessionId: string, error: unknown) => void
 }
 
 function findMessageByLocalId(
@@ -58,7 +60,7 @@ export function useSendMessage(
             if (!api) {
                 throw new Error('API unavailable')
             }
-            await api.sendMessage(input.sessionId, input.text, input.localId, input.attachments)
+            return await api.sendMessage(input.sessionId, input.text, input.localId, input.attachments)
         },
         onMutate: async (input) => {
             const optimisticMessage: DecryptedMessage = {
@@ -80,13 +82,15 @@ export function useSendMessage(
 
             appendOptimisticMessage(input.sessionId, optimisticMessage)
         },
-        onSuccess: (_, input) => {
+        onSuccess: (response, input) => {
             updateMessageStatus(input.sessionId, input.localId, 'sent')
             haptic.notification('success')
+            options?.onSent?.(input.sessionId, response)
         },
         onError: (error, input) => {
             updateMessageStatus(input.sessionId, input.localId, 'failed')
             haptic.notification('error')
+            options?.onSendFailed?.(input.sessionId, error)
 
             // Log error details for debugging
             const errorMessage = error instanceof Error ? error.message : String(error)

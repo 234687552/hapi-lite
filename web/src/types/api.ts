@@ -70,6 +70,14 @@ export type MessagesResponse = {
         hasMore: boolean
     }
 }
+export type SendMessageResponse = {
+    ok: boolean
+    runtime?: {
+        active: boolean
+        thinking: boolean
+        thinkingAt: number
+    }
+}
 
 export type MachinesResponse = { machines: Machine[] }
 export type MachinePathsExistsResponse = { exists: Record<string, boolean> }

@@ -12,6 +12,7 @@ import {
     useRef,
     useState
 } from 'react'
+import { useComposerStatus } from '@/hooks/useComposerStatus'
 import type { AgentState, ModelMode, PermissionMode } from '@/types/api'
 import type { Suggestion } from '@/hooks/useActiveSuggestions'
 import { useActiveWord } from '@/hooks/useActiveWord'
@@ -42,7 +43,6 @@ export function HappyComposer(props: {
     active?: boolean
     allowSendWhenInactive?: boolean
     thinking?: boolean
-    activeAt?: number
     thinkingAt?: number
     agentState?: AgentState | null
     contextSize?: number
@@ -66,7 +66,6 @@ export function HappyComposer(props: {
         active = true,
         allowSendWhenInactive = false,
         thinking = false,
-        activeAt,
         thinkingAt,
         agentState,
         contextSize,
@@ -114,10 +113,16 @@ export function HappyComposer(props: {
         selection: { start: 0, end: 0 }
     })
     const [showSettings, setShowSettings] = useState(false)
-    const [isAborting, setIsAborting] = useState(false)
     const [isSwitching, setIsSwitching] = useState(false)
     const [showContinueHint, setShowContinueHint] = useState(false)
-    const [runtimeThinkingAt, setRuntimeThinkingAt] = useState<number | null>(null)
+
+    const { phase, thinkingStartedAt, isAborting, startAbort } = useComposerStatus({
+        active,
+        thinking: thinking || threadIsRunning,
+        isSending: disabled,
+        agentState,
+        thinkingAt,
+    })
 
     const textareaRef = useRef<HTMLTextAreaElement>(null)
     const prevControlledByUser = useRef(controlledByUser)
@@ -232,21 +237,6 @@ export function HappyComposer(props: {
     const showTerminalButton = Boolean(onTerminal)
 
     useEffect(() => {
-        if (!isAborting) return
-        if (threadIsRunning) return
-        setIsAborting(false)
-    }, [isAborting, threadIsRunning])
-
-    useEffect(() => {
-        const runtimeThinking = threadIsRunning || thinking || disabled || isAborting
-        if (runtimeThinking) {
-            setRuntimeThinkingAt((prev) => prev ?? Date.now())
-            return
-        }
-        setRuntimeThinkingAt(null)
-    }, [threadIsRunning, thinking, disabled, isAborting])
-
-    useEffect(() => {
         if (!isSwitching) return
         if (controlledByUser) return
         setIsSwitching(false)
@@ -255,9 +245,9 @@ export function HappyComposer(props: {
     const handleAbort = useCallback(() => {
         if (abortDisabled) return
         haptic('error')
-        setIsAborting(true)
+        startAbort()
         api.thread().cancelRun()
-    }, [abortDisabled, api, haptic])
+    }, [abortDisabled, api, haptic, startAbort])
 
     const handleSwitch = useCallback(async () => {
         if (switchDisabled || !onSwitchToRemote) return
@@ -418,10 +408,6 @@ export function HappyComposer(props: {
     const showPermissionSettings = Boolean(onPermissionModeChange && permissionModeOptions.length > 0)
     const showModelSettings = Boolean(onModelModeChange && !isCodexFamilyFlavor(agentFlavor))
     const showSettingsButton = Boolean(showPermissionSettings || showModelSettings)
-    const statusThinking = thinking || threadIsRunning || disabled || isAborting
-    const statusThinkingAt = (typeof thinkingAt === 'number' && thinkingAt > 0)
-        ? thinkingAt
-        : (runtimeThinkingAt ?? undefined)
 
     const handleSend = useCallback(() => {
         api.composer().send()
@@ -551,11 +537,8 @@ export function HappyComposer(props: {
                     {overlays}
 
                     <StatusBar
-                        active={active}
-                        thinking={statusThinking}
-                        activeAt={activeAt}
-                        thinkingAt={statusThinkingAt}
-                        agentState={agentState}
+                        phase={phase}
+                        thinkingStartedAt={thinkingStartedAt}
                         contextSize={contextSize}
                         inputTokens={inputTokens}
                         outputTokens={outputTokens}
