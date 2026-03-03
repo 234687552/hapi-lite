@@ -59,6 +59,43 @@ type Metadata struct {
 	Worktree          *WorktreeMetadata `json:"worktree,omitempty"`
 }
 
+func GetAgentSessionID(meta *Metadata, agent string) string {
+	if meta == nil {
+		return ""
+	}
+	switch agent {
+	case string(FlavorClaude):
+		return meta.ClaudeSessionID
+	case string(FlavorCodex):
+		return meta.CodexSessionID
+	case string(FlavorGemini):
+		return meta.GeminiSessionID
+	case string(FlavorOpencode):
+		return meta.OpencodeSessionID
+	default:
+		return ""
+	}
+}
+
+func SetAgentSessionID(meta *Metadata, agent, value string) bool {
+	if meta == nil {
+		return false
+	}
+	switch agent {
+	case string(FlavorClaude):
+		meta.ClaudeSessionID = value
+	case string(FlavorCodex):
+		meta.CodexSessionID = value
+	case string(FlavorGemini):
+		meta.GeminiSessionID = value
+	case string(FlavorOpencode):
+		meta.OpencodeSessionID = value
+	default:
+		return false
+	}
+	return true
+}
+
 type Session struct {
 	ID             string      `json:"id"`
 	Seq            int64       `json:"seq"`

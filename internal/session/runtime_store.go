@@ -1,6 +1,28 @@
 package session
 
-import "sync"
+import (
+	"errors"
+	"fmt"
+	"sync"
+)
+
+type RuntimeState string
+
+const (
+	RuntimeStateInactive RuntimeState = "INACTIVE"
+	RuntimeStateReady    RuntimeState = "READY"
+	RuntimeStateRunning  RuntimeState = "RUNNING"
+)
+
+type RuntimeTransition string
+
+const (
+	RuntimeTransitionSend     RuntimeTransition = "send"
+	RuntimeTransitionComplete RuntimeTransition = "complete"
+	RuntimeTransitionArchive  RuntimeTransition = "archive"
+)
+
+var ErrInvalidRuntimeTransition = errors.New("invalid runtime transition")
 
 type RuntimeSnapshot struct {
 	State     RuntimeState `json:"state"`
@@ -70,4 +92,22 @@ func normalizeRuntimeSnapshot(snap RuntimeSnapshot) RuntimeSnapshot {
 		snap.RunningAt = 0
 	}
 	return snap
+}
+
+func NextRuntimeState(current RuntimeState, action RuntimeTransition) (RuntimeState, error) {
+	switch action {
+	case RuntimeTransitionSend:
+		if current == RuntimeStateReady {
+			return RuntimeStateRunning, nil
+		}
+	case RuntimeTransitionComplete:
+		if current == RuntimeStateRunning {
+			return RuntimeStateReady, nil
+		}
+	case RuntimeTransitionArchive:
+		if current == RuntimeStateReady || current == RuntimeStateRunning {
+			return RuntimeStateInactive, nil
+		}
+	}
+	return current, fmt.Errorf("%w: %s -> %s", ErrInvalidRuntimeTransition, current, action)
 }

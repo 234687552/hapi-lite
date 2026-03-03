@@ -15,6 +15,42 @@ type SessionHandler struct {
 	*BaseHandler
 }
 
+type slashCommand struct {
+	Name        string
+	Description string
+	Source      string
+}
+
+var defaultSlashCommands = []slashCommand{
+	{Name: "clear", Description: "Clear conversation history", Source: "builtin"},
+	{Name: "status", Description: "Show session status", Source: "builtin"},
+}
+
+func slashCommandsForAgent(agent string) []slashCommand {
+	var commands []slashCommand
+	switch agent {
+	case string(session.FlavorClaude):
+		commands = defaultSlashCommands
+	case string(session.FlavorCodex):
+		commands = []slashCommand{
+			{Name: "review", Description: "Review current changes and find issues", Source: "builtin"},
+			{Name: "status", Description: "Show current session status", Source: "builtin"},
+		}
+	case string(session.FlavorGemini):
+		commands = []slashCommand{
+			{Name: "about", Description: "Show version info", Source: "builtin"},
+			{Name: "clear", Description: "Clear the conversation", Source: "builtin"},
+		}
+	case string(session.FlavorOpencode):
+		commands = []slashCommand{}
+	default:
+		commands = defaultSlashCommands
+	}
+	out := make([]slashCommand, len(commands))
+	copy(out, commands)
+	return out
+}
+
 func (h *SessionHandler) publishStateChange(sessionID string, reason string) {
 	if h.Broker == nil {
 		return
@@ -315,7 +351,7 @@ func (h *SessionHandler) ListSlashCommands(c *gin.Context) {
 		flavor = sess.Metadata.Flavor
 	}
 
-	rawCommands := session.SlashCommandsForAgent(flavor)
+	rawCommands := slashCommandsForAgent(flavor)
 	commands := make([]gin.H, 0, len(rawCommands))
 	for _, cmd := range rawCommands {
 		commands = append(commands, gin.H{

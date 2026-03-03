@@ -529,7 +529,7 @@ func (m *Manager) SetPermissionMode(sessionID string, mode string) {
 	if !ok {
 		return
 	}
-	proc.Req.Yolo = IsYoloPermissionMode(proc.Req.Agent, mode)
+	proc.Req.Yolo = isYoloPermissionMode(proc.Req.Agent, mode)
 }
 
 func (m *Manager) SetModelMode(sessionID string, model string) {
@@ -548,5 +548,16 @@ func toPipelineRequest(req CreateSessionRequest) pipeline.Request {
 		Directory: req.Directory,
 		Model:     req.Model,
 		Yolo:      req.Yolo,
+	}
+}
+
+func isYoloPermissionMode(agent, mode string) bool {
+	switch agent {
+	case string(FlavorClaude):
+		return mode == "bypassPermissions"
+	case string(FlavorCodex), string(FlavorGemini), string(FlavorOpencode):
+		return mode == "yolo"
+	default:
+		return mode == "bypassPermissions"
 	}
 }
