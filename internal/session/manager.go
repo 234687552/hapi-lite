@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,11 +15,17 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/liangzd/hapi-lite/internal/scanner"
+	pipeline "github.com/liangzd/hapi-lite/internal/session/agent"
+	"github.com/liangzd/hapi-lite/internal/session/agent/claude"
+	"github.com/liangzd/hapi-lite/internal/session/agent/codex"
+	"github.com/liangzd/hapi-lite/internal/session/agent/gemini"
+	"github.com/liangzd/hapi-lite/internal/session/agent/opencode"
 )
 
 type Manager struct {
 	mu                  sync.RWMutex
 	agents              map[string]*AgentProcess
+	runtimes            *RuntimeStore
 	onEvent             func(sessionID string, event SyncEvent)
 	onMessage           func(sessionID string, msg Message)
 	onUpdateAgentSessId func(sessionID, agentSessionID, agent string) // 持久化 agentSessionID 到 DB
@@ -28,15 +35,28 @@ type AgentProcess struct {
 	AgentSessionID string
 	Req            CreateSessionRequest
 	Scanner        scanner.Scanner
-	Running        bool
-	RunningAt      int64
 	seq            int64
 	cancel         context.CancelFunc
 }
 
+type agentRuntime struct {
+	name              string
+	mode              pipeline.Mode
+	stderrMode        pipeline.StderrMode
+	emitExitError     bool
+	noContentFallback string
+	after             func(input pipeline.SendInput, line []byte, ctx pipeline.ParseContext) []pipeline.Action
+}
+
+var (
+	ErrNoActiveAgent = errors.New("no active agent")
+	ErrAgentBusy     = errors.New("agent is busy")
+)
+
 func NewManager(onEvent func(string, SyncEvent), onMessage func(string, Message), onUpdateAgentSessId func(string, string, string)) *Manager {
 	return &Manager{
 		agents:              make(map[string]*AgentProcess),
+		runtimes:            NewRuntimeStore(),
 		onEvent:             onEvent,
 		onMessage:           onMessage,
 		onUpdateAgentSessId: onUpdateAgentSessId,
@@ -49,35 +69,33 @@ func (m *Manager) SpawnAgent(sessionID string, req CreateSessionRequest, startSe
 
 func (m *Manager) SpawnAgentWithSession(sessionID string, req CreateSessionRequest, startSeq int64, agentSessionID string) {
 	if req.Agent == "" {
-		req.Agent = "claude"
+		req.Agent = string(FlavorClaude)
 	}
 	if startSeq < 0 {
 		startSeq = 0
 	}
 	proc := &AgentProcess{Req: req, seq: startSeq, AgentSessionID: agentSessionID}
 
-	// Gemini/OpenCode still use file-based scanners.
-	// Codex uses `codex exec --json` parsing in-process.
-	if req.Agent != "claude" && req.Agent != "codex" {
-		msgCb := func(sid string, sm scanner.ScannedMessage) {
-			m.emitMessage(sid, proc, sm.Content, sm.CreatedAt)
-		}
-		var sc scanner.Scanner
-		switch req.Agent {
-		case "gemini":
-			sc = scanner.NewGeminiScanner(msgCb)
-		case "opencode":
-			sc = scanner.NewOpencodeScanner(msgCb)
-		}
-		proc.Scanner = sc
-		if sc != nil {
-			sc.Start(sessionID, "", req.Directory)
-		}
+	msgCb := func(sid string, sm scanner.ScannedMessage) {
+		m.emitMessage(sid, proc, sm.Content, sm.CreatedAt)
+	}
+	var sc scanner.Scanner
+	switch req.Agent {
+	case string(FlavorGemini):
+		sc = scanner.NewGeminiScanner(msgCb)
+	case string(FlavorOpencode):
+		sc = scanner.NewOpencodeScanner(msgCb)
+	}
+	proc.Scanner = sc
+	if sc != nil {
+		sc.Start(sessionID, "", req.Directory)
 	}
 
 	m.mu.Lock()
 	m.agents[sessionID] = proc
 	m.mu.Unlock()
+
+	m.runtimes.Set(sessionID, RuntimeSnapshot{State: RuntimeStateReady})
 }
 
 func (m *Manager) StopAgent(sessionID string) {
@@ -96,6 +114,10 @@ func (m *Manager) StopAgent(sessionID string) {
 	m.mu.Lock()
 	delete(m.agents, sessionID)
 	m.mu.Unlock()
+
+	if _, err := m.runtimes.Transition(sessionID, RuntimeTransitionArchive, 0); err != nil {
+		m.runtimes.Set(sessionID, RuntimeSnapshot{State: RuntimeStateInactive})
+	}
 }
 
 func (m *Manager) HasAgent(sessionID string) bool {
@@ -115,275 +137,228 @@ func (m *Manager) AbortAgent(sessionID string) {
 }
 
 func (m *Manager) IsRunning(sessionID string) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	proc, ok := m.agents[sessionID]
-	if !ok {
-		return false
-	}
-	return proc.Running
+	return m.runtimes.Get(sessionID).State == RuntimeStateRunning
 }
 
 func (m *Manager) RunningAt(sessionID string) int64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	proc, ok := m.agents[sessionID]
-	if !ok {
-		return 0
-	}
-	return proc.RunningAt
+	return m.runtimes.Get(sessionID).RunningAt
 }
 
-func (m *Manager) SendMessage(sessionID string, text string) error {
+func (m *Manager) RuntimeSnapshot(sessionID string) RuntimeSnapshot {
+	return m.runtimes.Get(sessionID)
+}
+
+func (m *Manager) SendMessage(sessionID string, text string) (string, error) {
 	m.mu.Lock()
 	proc, ok := m.agents[sessionID]
 	if !ok {
 		m.mu.Unlock()
-		return fmt.Errorf("no active agent for session %s", sessionID)
+		return "", fmt.Errorf("%w for session %s", ErrNoActiveAgent, sessionID)
 	}
-	if proc.Running {
+	state := m.runtimes.Get(sessionID).State
+	if state == RuntimeStateRunning {
 		m.mu.Unlock()
-		return fmt.Errorf("agent is busy, please wait for the current message to complete")
+		return "", fmt.Errorf("%w, please wait for the current message to complete", ErrAgentBusy)
 	}
-
-	// 拦截 /clear：清空 AgentSessionID，下次发消息开新 agent session
-	if strings.TrimSpace(text) == "/clear" {
-		proc.AgentSessionID = ""
+	if state != RuntimeStateReady {
 		m.mu.Unlock()
-		if m.onUpdateAgentSessId != nil {
-			m.onUpdateAgentSessId(sessionID, "", proc.Req.Agent)
-		}
-		m.emitMessage(sessionID, proc, buildEventMessage("message", map[string]interface{}{"type": "message", "message": "Context was reset"}), time.Now().UnixMilli())
-		if m.onEvent != nil {
-			m.onEvent(sessionID, SyncEvent{Type: "session-updated", SessionID: sessionID})
-		}
-		return nil
+		return "", fmt.Errorf("%w: session %s is %s", ErrInvalidRuntimeTransition, sessionID, state)
 	}
-
-	proc.Running = true
-	proc.RunningAt = time.Now().UnixMilli()
+	input := pipeline.SendInput{
+		Request:        toPipelineRequest(proc.Req),
+		Text:           text,
+		AgentSessionID: proc.AgentSessionID,
+	}
+	var (
+		agentInfo  agentRuntime
+		sendResult pipeline.SendResult
+		err        error
+	)
 	ctx, cancel := context.WithCancel(context.Background())
+	switch proc.Req.Agent {
+	case string(FlavorClaude):
+		p := claude.New()
+		agentInfo = agentRuntime{
+			name:              p.Name(),
+			mode:              p.Mode(),
+			stderrMode:        p.StderrMode(),
+			emitExitError:     p.EmitExitError(),
+			noContentFallback: p.NoContentFallback(),
+			after:             p.After,
+		}
+		sendResult, err = p.Send(ctx, input)
+	case string(FlavorCodex):
+		p := codex.New()
+		agentInfo = agentRuntime{
+			name:              p.Name(),
+			mode:              p.Mode(),
+			stderrMode:        p.StderrMode(),
+			emitExitError:     p.EmitExitError(),
+			noContentFallback: p.NoContentFallback(),
+			after:             p.After,
+		}
+		sendResult, err = p.Send(ctx, input)
+	case string(FlavorGemini):
+		p := gemini.New()
+		agentInfo = agentRuntime{
+			name:              p.Name(),
+			mode:              p.Mode(),
+			stderrMode:        p.StderrMode(),
+			emitExitError:     p.EmitExitError(),
+			noContentFallback: p.NoContentFallback(),
+			after:             p.After,
+		}
+		sendResult, err = p.Send(ctx, input)
+	case string(FlavorOpencode):
+		p := opencode.New()
+		agentInfo = agentRuntime{
+			name:              p.Name(),
+			mode:              p.Mode(),
+			stderrMode:        p.StderrMode(),
+			emitExitError:     p.EmitExitError(),
+			noContentFallback: p.NoContentFallback(),
+			after:             p.After,
+		}
+		sendResult, err = p.Send(ctx, input)
+	}
+	if agentInfo.name == "" {
+		cancel()
+		m.mu.Unlock()
+		return "", fmt.Errorf("unsupported agent: %s", proc.Req.Agent)
+	}
+	if err != nil {
+		cancel()
+		m.mu.Unlock()
+		return "", fmt.Errorf("%s send failed: %w", agentInfo.name, err)
+	}
+
+	if sendResult.Stop {
+		cancel()
+		m.mu.Unlock()
+		m.applyPipelineActions(sessionID, proc, agentInfo.name, sendResult.BeforeActions, false)
+		reason := sendResult.StopReason
+		if reason == "" {
+			reason = "send-stopped"
+		}
+		m.emitRuntimeStateChanged(sessionID, reason)
+		return "", nil
+	}
+
+	cmdOutput := sendResult.Command
+	if cmdOutput.Cmd == nil {
+		cancel()
+		m.mu.Unlock()
+		return "", fmt.Errorf("%s send returned empty command", agentInfo.name)
+	}
+
+	startedAt := time.Now().UnixMilli()
+	if _, err := m.runtimes.Transition(sessionID, RuntimeTransitionSend, startedAt); err != nil {
+		cancel()
+		m.mu.Unlock()
+		return "", err
+	}
 	proc.cancel = cancel
 	m.mu.Unlock()
 
-	// Always persist user prompts to database for all agent types
-	raw := buildRoleWrappedMessage("user", map[string]interface{}{
-		"type": "text",
-		"text": text,
-	})
-	m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
-
-	if m.onEvent != nil {
-		m.onEvent(sessionID, SyncEvent{Type: "session-updated", SessionID: sessionID})
+	if len(sendResult.BeforeActions) > 0 {
+		m.applyPipelineActions(sessionID, proc, agentInfo.name, sendResult.BeforeActions, false)
 	}
 
-	go m.runOnce(ctx, cancel, sessionID, proc, text)
-	return nil
+	requestID := uuid.New().String()
+
+	// Always persist user prompts to database for all agent types
+	raw := pipeline.BuildRoleWrappedMessage("user", map[string]interface{}{
+		"type": "text",
+		"text": sendResult.Input.Text,
+	})
+	m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
+	m.emitRuntimeStateChanged(sessionID, "started")
+
+	go m.runOnce(ctx, cancel, sessionID, proc, agentInfo, sendResult)
+	return requestID, nil
 }
 
-func (m *Manager) runOnce(ctx context.Context, cancel context.CancelFunc, sessionID string, proc *AgentProcess, text string) {
+func (m *Manager) runOnce(ctx context.Context, cancel context.CancelFunc, sessionID string, proc *AgentProcess, agentInfo agentRuntime, sendResult pipeline.SendResult) {
 	defer func() {
 		cancel()
 		m.mu.Lock()
-		proc.Running = false
-		proc.RunningAt = 0
 		proc.cancel = nil
 		m.mu.Unlock()
-		if m.onEvent != nil {
-			m.onEvent(sessionID, SyncEvent{Type: "session-updated", SessionID: sessionID})
-		}
+		_, _ = m.runtimes.Transition(sessionID, RuntimeTransitionComplete, 0)
+		m.emitRuntimeStateChanged(sessionID, "completed")
 	}()
 
 	req := proc.Req
-	cmd := m.buildCmd(ctx, sessionID, req, text)
+	cmdOutput := sendResult.Command
+	if cmdOutput.AgentSessionID != "" && cmdOutput.AgentSessionID != proc.AgentSessionID {
+		m.mu.Lock()
+		proc.AgentSessionID = cmdOutput.AgentSessionID
+		m.mu.Unlock()
+		if m.onUpdateAgentSessId != nil {
+			m.onUpdateAgentSessId(sessionID, cmdOutput.AgentSessionID, agentInfo.name)
+		}
+	}
+	cmd := cmdOutput.Cmd
 	if cmd == nil {
 		return
 	}
+	cmd.Dir = req.Directory
+	cmd.Env = append(filteredEnvWithoutClaudeCode(), "TERM=dumb")
+	// 设置新进程组，abort 时可以杀整个进程树（包括孙进程）
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	// For claude: capture stdout to parse stream-json
-	if req.Agent == "claude" {
-		m.runClaude(ctx, cmd, sessionID, proc)
+	if agentInfo.mode == pipeline.ModeStream {
+		m.runStreamCommand(ctx, cmd, sessionID, proc, agentInfo, sendResult.Input)
 		return
 	}
-	if req.Agent == "codex" {
-		m.runCodex(ctx, cmd, sessionID, proc)
-		return
-	}
 
-	// Other agents: just run, scanner handles output
+	// Detached pipelines: scanner handles output, command only triggers remote generation.
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "spawn error: %v\n", err)
-		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to start %s: %v", req.Agent, err)), time.Now().UnixMilli())
+		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to start %s: %v", agentInfo.name, err)), time.Now().UnixMilli())
 		return
 	}
 	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
-		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("%s exited with error: %v", req.Agent, err)), time.Now().UnixMilli())
+		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("%s exited with error: %v", agentInfo.name, err)), time.Now().UnixMilli())
 	}
 }
 
-func (m *Manager) buildCmd(ctx context.Context, sessionID string, req CreateSessionRequest, text string) *exec.Cmd {
-	m.mu.RLock()
-	agentSessionID := m.agents[sessionID].AgentSessionID
-	m.mu.RUnlock()
-
-	var cmd *exec.Cmd
-	switch req.Agent {
-	case "claude":
-		// `--verbose` is required for stable stream-json event coverage
-		// (including thinking-related assistant blocks in newer Claude CLI versions).
-		args := []string{"--print", "--verbose", "--output-format", "stream-json"}
-		if req.Yolo {
-			args = append(args, "--dangerously-skip-permissions")
-		}
-		if req.Model != "" && req.Model != "default" {
-			args = append(args, "--model", req.Model)
-		}
-		if agentSessionID != "" {
-			args = append(args, "--resume", agentSessionID)
-		} else {
-			agentSessionID = uuid.New().String()
-			m.mu.Lock()
-			m.agents[sessionID].AgentSessionID = agentSessionID
-			m.mu.Unlock()
-			if m.onUpdateAgentSessId != nil {
-				m.onUpdateAgentSessId(sessionID, agentSessionID, "claude")
-			}
-			args = append(args, "--session-id", agentSessionID)
-		}
-		args = append(args, text)
-		cmd = exec.CommandContext(ctx, "claude", args...)
-	case "codex":
-		var args []string
-		if agentSessionID != "" {
-			args = []string{"exec", "resume", "--json", "--skip-git-repo-check"}
-			if req.Yolo {
-				args = append(args, "--full-auto")
-			}
-			if req.Model != "" && req.Model != "default" {
-				args = append(args, "--model", req.Model)
-			}
-			args = append(args, agentSessionID, text)
-		} else {
-			args = []string{"exec", "--json", "--skip-git-repo-check"}
-			if req.Yolo {
-				args = append(args, "--full-auto")
-			}
-			if req.Model != "" && req.Model != "default" {
-				args = append(args, "--model", req.Model)
-			}
-			args = append(args, text)
-		}
-		cmd = exec.CommandContext(ctx, "codex", args...)
-	case "gemini":
-		cmd = exec.CommandContext(ctx, "gemini", text)
-	case "opencode":
-		cmd = exec.CommandContext(ctx, "opencode", text)
-	default:
-		return nil
-	}
-	cmd.Dir = req.Directory
-	// Filter out CLAUDECODE env var to avoid nested session detection
-	var env []string
-	for _, e := range os.Environ() {
-		if len(e) > 10 && e[:10] == "CLAUDECODE" {
-			continue
-		}
-		env = append(env, e)
-	}
-	cmd.Env = append(env, "TERM=dumb")
-	// 设置新进程组，abort 时可以杀整个进程树（包括孙进程）
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	return cmd
-}
-
-func (m *Manager) runClaude(ctx context.Context, cmd *exec.Cmd, sessionID string, proc *AgentProcess) {
+func (m *Manager) runStreamCommand(ctx context.Context, cmd *exec.Cmd, sessionID string, proc *AgentProcess, agentInfo agentRuntime, sendInput pipeline.SendInput) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "stdout pipe error: %v\n", err)
-		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to initialize Claude output: %v", err)), time.Now().UnixMilli())
+		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to initialize %s output: %v", agentInfo.name, err)), time.Now().UnixMilli())
 		return
 	}
 
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "stderr pipe error: %v\n", err)
-		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to initialize Claude error output: %v", err)), time.Now().UnixMilli())
-		return
+	var (
+		stderrBuf strings.Builder
+		stderrWG  sync.WaitGroup
+	)
+	if agentInfo.stderrMode == pipeline.StderrCapture {
+		stderr, pipeErr := cmd.StderrPipe()
+		if pipeErr != nil {
+			m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to initialize %s error output: %v", agentInfo.name, pipeErr)), time.Now().UnixMilli())
+			return
+		}
+		stderrWG.Add(1)
+		go func() {
+			defer stderrWG.Done()
+			scanner := bufio.NewScanner(stderr)
+			for scanner.Scan() {
+				line := scanner.Text()
+				fmt.Fprintf(os.Stderr, "%s stderr: %s\n", agentInfo.name, line)
+				stderrBuf.WriteString(line)
+				stderrBuf.WriteString("\n")
+			}
+		}()
+	} else {
+		cmd.Stderr = os.Stderr
 	}
 
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "spawn error: %v\n", err)
-		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to start Claude: %v", err)), time.Now().UnixMilli())
-		return
-	}
-	stopKill := hookCancelKillProcessGroup(ctx, cmd)
-	defer stopKill()
-
-	// Capture stderr in a goroutine
-	var stderrBuf strings.Builder
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			line := scanner.Text()
-			fmt.Fprintf(os.Stderr, "Claude stderr: %s\n", line)
-			stderrBuf.WriteString(line)
-			stderrBuf.WriteString("\n")
-		}
-	}()
-
-	sc := bufio.NewScanner(stdout)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
-
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var peek struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(line, &peek) != nil {
-			continue
-		}
-		if peek.Type != "user" && peek.Type != "assistant" && peek.Type != "summary" {
-			continue
-		}
-
-		raw := json.RawMessage(append([]byte{}, line...))
-		m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
-	}
-
-	cmd.Wait()
-	wg.Wait() // Wait for stderr goroutine to finish
-
-	// abort 时不上报错误
-	if ctx.Err() != nil {
-		return
-	}
-
-	// If there were stderr messages, send them to the frontend
-	if stderrOutput := strings.TrimSpace(stderrBuf.String()); stderrOutput != "" {
-		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("⚠️ Claude Error:\n%s", stderrOutput)), time.Now().UnixMilli())
-	}
-}
-
-func (m *Manager) runCodex(ctx context.Context, cmd *exec.Cmd, sessionID string, proc *AgentProcess) {
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "stdout pipe error: %v\n", err)
-		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to initialize codex output: %v", err)), time.Now().UnixMilli())
-		return
-	}
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "spawn error: %v\n", err)
-		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to start codex: %v", err)), time.Now().UnixMilli())
+		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("Failed to start %s: %v", agentInfo.name, err)), time.Now().UnixMilli())
 		return
 	}
 	stopKill := hookCancelKillProcessGroup(ctx, cmd)
@@ -398,172 +373,87 @@ func (m *Manager) runCodex(ctx context.Context, cmd *exec.Cmd, sessionID string,
 		if len(line) == 0 {
 			continue
 		}
-
-		var event map[string]interface{}
-		if json.Unmarshal(line, &event) != nil {
-			continue
-		}
-
-		eventType := asStringValue(event["type"])
-
-		// 捕获 thread_id 用于后续 resume
-		if eventType == "thread.started" {
-			if threadID := asStringValue(event["thread_id"]); threadID != "" && proc.AgentSessionID == "" {
-				m.mu.Lock()
-				proc.AgentSessionID = threadID
-				m.mu.Unlock()
-				if m.onUpdateAgentSessId != nil {
-					m.onUpdateAgentSessId(sessionID, threadID, "codex")
-				}
-			}
-			continue
-		}
-
-		if eventType != "item.completed" {
-			continue
-		}
-		item, _ := event["item"].(map[string]interface{})
-		itemType := asStringValue(item["type"])
-		switch itemType {
-		case "agent_message":
-			text := strings.TrimRight(asStringValue(item["text"]), "\r\n")
-			if text == "" {
-				continue
-			}
-			raw := buildRoleWrappedMessage("agent", map[string]interface{}{
-				"type": "codex",
-				"data": map[string]interface{}{
-					"type":    "message",
-					"message": text,
-					"id":      uuid.New().String(),
-				},
-			})
-			m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
-			emitted = true
-		case "reasoning":
-			text := strings.TrimRight(asStringValue(item["text"]), "\r\n")
-			if text == "" {
-				continue
-			}
-			raw := buildRoleWrappedMessage("agent", map[string]interface{}{
-				"type": "codex",
-				"data": map[string]interface{}{
-					"type":    "reasoning",
-					"message": text,
-					"id":      uuid.New().String(),
-				},
-			})
-			m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
-			emitted = true
-		case "tool_call", "tool-call", "function_call":
-			callID := firstStringValue(item["call_id"], item["callId"], item["tool_call_id"], item["toolCallId"], item["id"])
-			name := asStringValue(item["name"])
-			if callID == "" || name == "" {
-				continue
-			}
-			input := item["input"]
-			if input == nil {
-				input = parseMaybeJSONValue(item["arguments"])
-			}
-			raw := buildRoleWrappedMessage("agent", map[string]interface{}{
-				"type": "codex",
-				"data": map[string]interface{}{
-					"type":   "tool-call",
-					"name":   name,
-					"callId": callID,
-					"input":  input,
-					"id":     uuid.New().String(),
-				},
-			})
-			m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
-			emitted = true
-		case "web_search":
-			callID := firstStringValue(item["id"], item["call_id"], item["callId"])
-			if callID == "" {
-				continue
-			}
-			query := asStringValue(item["query"])
-			action, _ := item["action"].(map[string]interface{})
-			url := ""
-			if action != nil {
-				url = asStringValue(action["url"])
-			}
-			input := map[string]interface{}{"query": query}
-			if url != "" {
-				input["url"] = url
-			}
-			toolName := "WebSearch"
-			if url != "" && query == url {
-				toolName = "WebFetch"
-				input = map[string]interface{}{"url": url}
-			}
-			// web_search 即完成，直接发一条已完成的 tool-call（带 result），避免分页截断导致 running 卡住
-			raw := buildRoleWrappedMessage("agent", map[string]interface{}{
-				"type": "codex",
-				"data": map[string]interface{}{
-					"type":   "tool-call",
-					"name":   toolName,
-					"callId": callID,
-					"input":  input,
-					"result": "done",
-					"id":     uuid.New().String(),
-				},
-			})
-			m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
-			emitted = true
-		case "command_execution":
-			cmdStr := strings.TrimRight(asStringValue(item["command"]), "\r\n")
-			if cmdStr == "" {
-				continue
-			}
-			callID := firstStringValue(item["id"], item["call_id"])
-			if callID == "" {
-				callID = uuid.New().String()
-			}
-			output := strings.TrimRight(asStringValue(item["aggregated_output"]), "\r\n")
-			exitCode := item["exit_code"]
-			raw := buildRoleWrappedMessage("agent", map[string]interface{}{
-				"type": "codex",
-				"data": map[string]interface{}{
-					"type":     "tool-call",
-					"name":     "Shell",
-					"callId":   callID,
-					"input":    map[string]interface{}{"command": cmdStr},
-					"result":   output,
-					"exitCode": exitCode,
-					"id":       uuid.New().String(),
-				},
-			})
-			m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
-			emitted = true
-		case "tool_result", "tool-call-result", "function_call_output":
-			callID := firstStringValue(item["call_id"], item["callId"], item["tool_call_id"], item["toolCallId"], item["id"])
-			if callID == "" {
-				continue
-			}
-			output := item["output"]
-			if output == nil {
-				output = item["content"]
-			}
-			raw := buildRoleWrappedMessage("agent", map[string]interface{}{
-				"type": "codex",
-				"data": map[string]interface{}{
-					"type":   "tool-call-result",
-					"callId": callID,
-					"output": output,
-					"id":     uuid.New().String(),
-				},
-			})
-			m.emitMessage(sessionID, proc, raw, time.Now().UnixMilli())
-			emitted = true
-		}
+		actions := agentInfo.after(sendInput, line, pipeline.ParseContext{
+			NewID: func() string {
+				return uuid.New().String()
+			},
+		})
+		emitted = m.applyPipelineActions(sessionID, proc, agentInfo.name, actions, emitted)
 	}
 
-	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
-		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("codex exited with error: %v", err)), time.Now().UnixMilli())
-	} else if !emitted && ctx.Err() == nil {
-		m.emitMessage(sessionID, proc, buildAssistantTextMessage("codex finished without response content"), time.Now().UnixMilli())
+	waitErr := cmd.Wait()
+	stderrWG.Wait()
+
+	if ctx.Err() != nil {
+		return
 	}
+
+	if stderrOutput := strings.TrimSpace(stderrBuf.String()); stderrOutput != "" {
+		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("⚠️ %s Error:\n%s", titleCaseASCII(agentInfo.name), stderrOutput)), time.Now().UnixMilli())
+	}
+	if waitErr != nil && agentInfo.emitExitError {
+		m.emitMessage(sessionID, proc, buildAssistantTextMessage(fmt.Sprintf("%s exited with error: %v", agentInfo.name, waitErr)), time.Now().UnixMilli())
+		return
+	}
+	if !emitted {
+		if fallback := agentInfo.noContentFallback; fallback != "" {
+			m.emitMessage(sessionID, proc, buildAssistantTextMessage(fallback), time.Now().UnixMilli())
+		}
+	}
+}
+
+func (m *Manager) applyPipelineActions(sessionID string, proc *AgentProcess, agent string, actions []pipeline.Action, emitted bool) bool {
+	handlers := map[pipeline.ActionKind]func(action pipeline.Action){
+		pipeline.ActionBindSessionID: func(action pipeline.Action) {
+			if !action.Force && (action.AgentSessionID == "" || proc.AgentSessionID == action.AgentSessionID) {
+				return
+			}
+			m.mu.Lock()
+			proc.AgentSessionID = action.AgentSessionID
+			m.mu.Unlock()
+			if m.onUpdateAgentSessId != nil {
+				m.onUpdateAgentSessId(sessionID, action.AgentSessionID, agent)
+			}
+		},
+		pipeline.ActionEmitMessage: func(action pipeline.Action) {
+			if len(action.Message) == 0 {
+				return
+			}
+			m.emitMessage(sessionID, proc, action.Message, time.Now().UnixMilli())
+			emitted = true
+		},
+	}
+
+	for _, action := range actions {
+		handler, ok := handlers[action.Kind]
+		if !ok {
+			continue
+		}
+		handler(action)
+	}
+	return emitted
+}
+
+func filteredEnvWithoutClaudeCode() []string {
+	env := make([]string, 0, 32)
+	for _, e := range os.Environ() {
+		if len(e) > 10 && e[:10] == "CLAUDECODE" {
+			continue
+		}
+		env = append(env, e)
+	}
+	return env
+}
+
+func titleCaseASCII(s string) string {
+	if s == "" {
+		return s
+	}
+	b := []byte(s)
+	if b[0] >= 'a' && b[0] <= 'z' {
+		b[0] = b[0] - ('a' - 'A')
+	}
+	return string(b)
 }
 
 func (m *Manager) emitMessage(sessionID string, proc *AgentProcess, raw json.RawMessage, createdAt int64) {
@@ -580,29 +470,29 @@ func (m *Manager) emitMessage(sessionID string, proc *AgentProcess, raw json.Raw
 	}
 	if m.onEvent != nil {
 		m.onEvent(sessionID, SyncEvent{
-			Type: "message-received", SessionID: sessionID, Message: &msg,
+			Type: SyncEventMessageAppended, SessionID: sessionID, Message: &msg,
 		})
 	}
 }
 
-func buildRoleWrappedMessage(role string, content interface{}) json.RawMessage {
-	b, _ := json.Marshal(map[string]interface{}{
-		"role":    role,
-		"content": content,
+func (m *Manager) emitRuntimeStateChanged(sessionID string, reason string) {
+	if m.onEvent == nil {
+		return
+	}
+	snap := m.runtimes.Get(sessionID)
+	m.onEvent(sessionID, SyncEvent{
+		Type:      SyncEventSessionStateChange,
+		SessionID: sessionID,
+		Data: SessionStateChangeData{
+			State:     snap.State,
+			RunningAt: snap.RunningAt,
+			Reason:    reason,
+		},
 	})
-	return json.RawMessage(b)
 }
 
 func buildAssistantTextMessage(text string) json.RawMessage {
-	return buildRoleWrappedMessage("assistant", text)
-}
-
-func buildEventMessage(_ string, data interface{}) json.RawMessage {
-	b, _ := json.Marshal(map[string]interface{}{
-		"role":    "agent",
-		"content": map[string]interface{}{"type": "event", "data": data},
-	})
-	return json.RawMessage(b)
+	return pipeline.BuildRoleWrappedMessage("assistant", text)
 }
 
 func hookCancelKillProcessGroup(ctx context.Context, cmd *exec.Cmd) func() {
@@ -632,37 +522,31 @@ func killProcessGroup(cmd *exec.Cmd) {
 	_ = cmd.Process.Kill()
 }
 
-func asStringValue(v interface{}) string {
-	s, _ := v.(string)
-	return s
-}
-
-func firstStringValue(values ...interface{}) string {
-	for _, v := range values {
-		if s, ok := v.(string); ok && s != "" {
-			return s
-		}
-	}
-	return ""
-}
-
-func parseMaybeJSONValue(v interface{}) interface{} {
-	s, ok := v.(string)
+func (m *Manager) SetPermissionMode(sessionID string, mode string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	proc, ok := m.agents[sessionID]
 	if !ok {
-		return v
+		return
 	}
-	trimmed := strings.TrimSpace(s)
-	if trimmed == "" {
-		return ""
-	}
-	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
-		var parsed interface{}
-		if json.Unmarshal([]byte(trimmed), &parsed) == nil {
-			return parsed
-		}
-	}
-	return s
+	proc.Req.Yolo = IsYoloPermissionMode(proc.Req.Agent, mode)
 }
 
-func (m *Manager) SetPermissionMode(sessionID string, mode string) {}
-func (m *Manager) SetModelMode(sessionID string, model string)     {}
+func (m *Manager) SetModelMode(sessionID string, model string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	proc, ok := m.agents[sessionID]
+	if !ok {
+		return
+	}
+	proc.Req.Model = model
+}
+
+func toPipelineRequest(req CreateSessionRequest) pipeline.Request {
+	return pipeline.Request{
+		Agent:     req.Agent,
+		Directory: req.Directory,
+		Model:     req.Model,
+		Yolo:      req.Yolo,
+	}
+}

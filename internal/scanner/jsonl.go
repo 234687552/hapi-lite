@@ -27,8 +27,8 @@ func findNewestFile(dir, ext string) string {
 	return newest
 }
 
-// tailJSONL tails a JSONL file from the current end, emitting new user/assistant/summary messages.
-func tailJSONL(stopCh chan struct{}, path, sessionID string, onMsg MessageCallback) {
+// tailJSONL tails a JSONL file from the current end, emitting mapped messages.
+func tailJSONL(stopCh chan struct{}, path, sessionID, agent string, onMsg MessageCallback) {
 	var offset int64
 	if info, err := os.Stat(path); err == nil {
 		offset = info.Size()
@@ -72,7 +72,7 @@ func tailJSONL(stopCh chan struct{}, path, sessionID string, onMsg MessageCallba
 				Type string `json:"type"`
 			}
 			json.Unmarshal(line, &peek)
-			if peek.Type != "user" && peek.Type != "assistant" && peek.Type != "summary" {
+			if !shouldEmitRawEnvelope(agent, peek.Type) {
 				continue
 			}
 			seq++
@@ -90,5 +90,14 @@ func tailJSONL(stopCh chan struct{}, path, sessionID string, onMsg MessageCallba
 		offset = info.Size()
 		f.Close()
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func shouldEmitRawEnvelope(agent, eventType string) bool {
+	switch agent {
+	case "claude", "gemini", "opencode":
+		return eventType == "user" || eventType == "assistant" || eventType == "summary"
+	default:
+		return false
 	}
 }

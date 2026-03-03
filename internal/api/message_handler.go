@@ -1,10 +1,9 @@
 package api
 
 import (
-	"fmt"
+	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/liangzd/hapi-lite/internal/session"
@@ -81,87 +80,18 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		return
 	}
 
-	text := req.Text
-	if len(req.Attachments) > 0 {
-		var b strings.Builder
-		b.WriteString(text)
-		b.WriteString("\n\nAttached files:\n")
-		for _, att := range req.Attachments {
-			if att.Path == "" {
-				continue
-			}
-			b.WriteString(fmt.Sprintf("- %s (%s)\n", att.Filename, att.Path))
-		}
-		text = b.String()
-	}
-
-	if h.Mgr != nil {
-		if !h.Mgr.HasAgent(sessionID) {
-			sess, err := h.Store.GetSession(sessionID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
-			}
-			if sess == nil {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Session not found"})
-				return
-			}
-
-			dir := "."
-			flavor := "claude"
-			if sess.Metadata != nil {
-				if sess.Metadata.Path != "" {
-					dir = sess.Metadata.Path
-				}
-				if sess.Metadata.Flavor != "" {
-					flavor = sess.Metadata.Flavor
-				}
-			}
-
-			startSeq, countErr := h.Store.GetMessageCount(sessionID)
-			if countErr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": countErr.Error()})
-				return
-			}
-			agentSID := ""
-			if sess.Metadata != nil {
-				switch flavor {
-				case "claude":
-					agentSID = sess.Metadata.ClaudeSessionID
-				case "codex":
-					agentSID = sess.Metadata.CodexSessionID
-				}
-			}
-			h.Mgr.SpawnAgentWithSession(sessionID, session.CreateSessionRequest{
-				Directory: dir,
-				Agent:     flavor,
-				Model:     sess.ModelMode,
-			}, startSeq, agentSID)
-			_ = h.Store.SetSessionActive(sessionID, true)
-			if h.Broker != nil {
-				h.Broker.Publish(session.SyncEvent{
-					Type: "session-updated", SessionID: sessionID,
-				})
-			}
-		}
-
-		if err := h.Mgr.SendMessage(sessionID, text); err != nil {
+	svc := NewSendService(h.Store, h.Broker, h.Mgr)
+	result, err := svc.Send(sessionID, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrSessionNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "Session not found"})
+		case errors.Is(err, session.ErrAgentBusy):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
 		}
+		return
 	}
-	runtime := gin.H{
-		"active":     true,
-		"thinking":   false,
-		"thinkingAt": int64(0),
-	}
-	if h.Mgr != nil {
-		runtime["active"] = h.Mgr.HasAgent(sessionID)
-		runtime["thinking"] = h.Mgr.IsRunning(sessionID)
-		runtime["thinkingAt"] = h.Mgr.RunningAt(sessionID)
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"ok":      true,
-		"runtime": runtime,
-	})
+	c.JSON(http.StatusAccepted, result)
 }

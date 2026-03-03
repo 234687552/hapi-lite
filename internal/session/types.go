@@ -31,7 +31,6 @@ type AgentStateCompletedRequest struct {
 }
 
 type AgentState struct {
-	ControlledByUser  *bool                                 `json:"controlledByUser,omitempty"`
 	Requests          map[string]AgentStateRequest          `json:"requests,omitempty"`
 	CompletedRequests map[string]AgentStateCompletedRequest `json:"completedRequests,omitempty"`
 }

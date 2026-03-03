@@ -160,7 +160,7 @@ function SessionPage() {
                 const resumedAt = Date.now()
 
                 // Optimistically flip local session state so status bar updates immediately
-                // even if SSE session-updated is delayed or temporarily disconnected.
+                // even if SSE state events are delayed or temporarily disconnected.
                 queryClient.setQueryData(
                     queryKeys.session(currentSessionId),
                     (old: { session?: { active?: boolean; activeAt?: number; thinking?: boolean; thinkingAt?: number } } | undefined) => {

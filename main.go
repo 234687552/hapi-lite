@@ -65,11 +65,8 @@ func main() {
 			if meta == nil {
 				meta = &session.Metadata{}
 			}
-			switch agent {
-			case "claude":
-				meta.ClaudeSessionID = agentSID
-			case "codex":
-				meta.CodexSessionID = agentSID
+			if !session.SetAgentSessionID(meta, agent, agentSID) {
+				return
 			}
 			st.UpdateSessionMeta(sid, meta)
 		},

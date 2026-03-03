@@ -89,7 +89,7 @@ Client                  API                  Manager               Agent CLI
   │                      │─────────────────────▶│                      │
   │                      │                      │ go runOnce()         │
   │                      │                      │─────────────────────▶│
-  │  {ok:true}           │                      │                      │
+  │  {ok:true, requestId}│                      │                      │
   │◀─────────────────────│                      │  exec.Command(...)   │
   │                      │                      │  cmd.Start()         │
   │                      │         ┌────────────┘                      │
@@ -100,9 +100,14 @@ Client                  API                  Manager               Agent CLI
   │                      │         │  → Store.InsertMessage()          │
   │                      │         │  → Broker.Publish(SyncEvent)      │
   │                      │         │                                   │
-  │  SSE: message-received         │                                   │
+  │  SSE: message-appended         │                                   │
   │◀───────────────────────────────┘                                   │
 ```
+
+当前发送链路采用统一派发：
+- `request -> sender dispatch -> <agent>Sender`
+- `<agent>Sender` 内部包含 `command builder map`（new/resume 等）
+- `<agent>Sender` 内部包含 `parse handler map`（event/item -> action）
 
 ### 3.3 删除会话流程
 
@@ -154,6 +159,9 @@ Client                  API                  Manager               SQLite
 | **gemini**   | `gemini <text>`                                | GeminiScanner tail `*.jsonl`                    | `~/.gemini/sessions/*.jsonl`         |
 | **opencode** | `opencode <text>`                              | OpencodeScanner tail `*.jsonl`                  | `~/.opencode/sessions/*.jsonl`       |
 
+> 统一映射入口：`internal/agentmap/catalog.go`  
+> 在这里维护“上游报文字段 -> 内部动作 -> 状态 -> 输出结构”的规则，新增字段/新增 agent 优先改这里。
+
 **Claude 消息格式**（stream-json 每行）：
 ```json
 {"type": "assistant", "content": [...]}
@@ -182,9 +190,9 @@ Client                  API                  Manager               SQLite
 | SyncEvent type      | 触发时机                        |
 |---------------------|---------------------------------|
 | `session-added`     | 创建新会话                      |
-| `session-updated`   | 会话状态变更（active/model 等） |
+| `session-state-changed` | 会话运行态变更（INACTIVE/READY/RUNNING） |
 | `session-removed`   | 删除会话                        |
-| `message-received`  | Agent 输出一条新消息            |
+| `message-appended`  | Agent 输出一条新消息            |
 
 ---
 
@@ -537,9 +545,9 @@ CreateSessionRequest {
 ### SyncEvent（SSE 推送事件）
 ```
 SyncEvent {
-  type: "session-added" | "session-updated" | "session-removed" | "message-received"
+  type: "session-added" | "session-state-changed" | "session-removed" | "message-appended"
   sessionId: string
-  message?: Message   // 仅 message-received 时附带
+  message?: Message   // 仅 message-appended 时附带
 }
 ```
 
@@ -605,11 +613,11 @@ emitMessage()
   ├── onMessage(sessionID, msg)
   │     └── Store.InsertMessage()   → 持久化到 SQLite
   │
-  └── onEvent(sessionID, SyncEvent{Type: "message-received", Message: &msg})
+  └── onEvent(sessionID, SyncEvent{Type: "message-appended", Message: &msg})
         └── Broker.Publish()        → 推送给所有 SSE 订阅者
 ```
 
-前端通过 EventSource 收到 `message-received` 事件后，将消息追加到本地 TanStack Query 缓存，无需重新请求接口。
+前端通过 EventSource 收到 `message-appended` 事件后，将消息追加到本地 TanStack Query 缓存，无需重新请求接口。
 
 ### 8.5 消息查询与分页
 

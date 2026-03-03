@@ -13,7 +13,7 @@ import {
     useState
 } from 'react'
 import { useComposerStatus } from '@/hooks/useComposerStatus'
-import type { AgentState, ModelMode, PermissionMode } from '@/types/api'
+import type { ModelMode, PermissionMode } from '@/types/api'
 import type { Suggestion } from '@/hooks/useActiveSuggestions'
 import { useActiveWord } from '@/hooks/useActiveWord'
 import { useActiveSuggestions } from '@/hooks/useActiveSuggestions'
@@ -44,15 +44,11 @@ export function HappyComposer(props: {
     allowSendWhenInactive?: boolean
     thinking?: boolean
     thinkingAt?: number
-    agentState?: AgentState | null
-    contextSize?: number
     inputTokens?: number
     outputTokens?: number
-    controlledByUser?: boolean
     agentFlavor?: string | null
     onPermissionModeChange?: (mode: PermissionMode) => void
     onModelModeChange?: (mode: ModelMode) => void
-    onSwitchToRemote?: () => void
     onTerminal?: () => void
     onDirectSend?: (text: string) => void
     autocompletePrefixes?: string[]
@@ -67,15 +63,11 @@ export function HappyComposer(props: {
         allowSendWhenInactive = false,
         thinking = false,
         thinkingAt,
-        agentState,
-        contextSize,
         inputTokens,
         outputTokens,
-        controlledByUser = false,
         agentFlavor,
         onPermissionModeChange,
         onModelModeChange,
-        onSwitchToRemote,
         onTerminal,
         onDirectSend,
         autocompletePrefixes = ['@', '/', '$'],
@@ -113,19 +105,15 @@ export function HappyComposer(props: {
         selection: { start: 0, end: 0 }
     })
     const [showSettings, setShowSettings] = useState(false)
-    const [isSwitching, setIsSwitching] = useState(false)
-    const [showContinueHint, setShowContinueHint] = useState(false)
 
     const { phase, thinkingStartedAt, isAborting, startAbort } = useComposerStatus({
         active,
         thinking: thinking || threadIsRunning,
         isSending: disabled,
-        agentState,
         thinkingAt,
     })
 
     const textareaRef = useRef<HTMLTextAreaElement>(null)
-    const prevControlledByUser = useRef(controlledByUser)
 
     useEffect(() => {
         setInputState((prev) => {
@@ -136,17 +124,6 @@ export function HappyComposer(props: {
             return { text: composerText, selection: { start: newPos, end: newPos } }
         })
     }, [composerText])
-
-    // Track one-time "continue" hint after switching from local to remote.
-    useEffect(() => {
-        if (prevControlledByUser.current === true && controlledByUser === false) {
-            setShowContinueHint(true)
-        }
-        if (controlledByUser) {
-            setShowContinueHint(false)
-        }
-        prevControlledByUser.current = controlledByUser
-    }, [controlledByUser])
 
     const { haptic: platformHaptic, isTouch } = usePlatform()
     const { isStandalone, isIOS } = usePWAInstall()
@@ -232,15 +209,7 @@ export function HappyComposer(props: {
     }, [api, suggestions, inputState, autocompletePrefixes, haptic, agentFlavor, canSend, onDirectSend, clearSuggestions])
 
     const abortDisabled = controlsDisabled || isAborting || !threadIsRunning
-    const switchDisabled = controlsDisabled || isSwitching || !controlledByUser
-    const showSwitchButton = Boolean(controlledByUser && onSwitchToRemote)
     const showTerminalButton = Boolean(onTerminal)
-
-    useEffect(() => {
-        if (!isSwitching) return
-        if (controlledByUser) return
-        setIsSwitching(false)
-    }, [isSwitching, controlledByUser])
 
     const handleAbort = useCallback(() => {
         if (abortDisabled) return
@@ -248,17 +217,6 @@ export function HappyComposer(props: {
         startAbort()
         api.thread().cancelRun()
     }, [abortDisabled, api, haptic, startAbort])
-
-    const handleSwitch = useCallback(async () => {
-        if (switchDisabled || !onSwitchToRemote) return
-        haptic('light')
-        setIsSwitching(true)
-        try {
-            await onSwitchToRemote()
-        } catch {
-            setIsSwitching(false)
-        }
-    }, [switchDisabled, onSwitchToRemote, haptic])
 
     const permissionModeOptions = useMemo(
         () => getPermissionModeOptionsForFlavor(agentFlavor),
@@ -388,7 +346,6 @@ export function HappyComposer(props: {
             event.preventDefault()
             return
         }
-        setShowContinueHint(false)
     }, [attachmentsReady])
 
     const handlePermissionChange = useCallback((mode: PermissionMode) => {
@@ -539,11 +496,8 @@ export function HappyComposer(props: {
                     <StatusBar
                         phase={phase}
                         thinkingStartedAt={thinkingStartedAt}
-                        contextSize={contextSize}
                         inputTokens={inputTokens}
                         outputTokens={outputTokens}
-                        modelMode={modelMode}
-                        permissionMode={permissionMode}
                         agentFlavor={agentFlavor}
                     />
 
@@ -558,7 +512,7 @@ export function HappyComposer(props: {
                             <ComposerPrimitive.Input
                                 ref={textareaRef}
                                 autoFocus={!controlsDisabled && !isTouch}
-                                placeholder={showContinueHint ? t('misc.typeMessage') : t('misc.typeAMessage')}
+                                placeholder={t('misc.typeAMessage')}
                                 disabled={controlsDisabled}
                                 maxRows={5}
                                 submitOnEnter={!isTouch}
@@ -583,10 +537,6 @@ export function HappyComposer(props: {
                             abortDisabled={abortDisabled}
                             isAborting={isAborting}
                             onAbort={handleAbort}
-                            showSwitchButton={showSwitchButton}
-                            switchDisabled={switchDisabled}
-                            isSwitching={isSwitching}
-                            onSwitch={handleSwitch}
                             onSend={handleSend}
                         />
                     </div>

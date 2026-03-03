@@ -20,25 +20,6 @@ function SettingsIcon() {
     )
 }
 
-function SwitchToRemoteIcon() {
-    return (
-        <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-        >
-            <rect x="5" y="2" width="14" height="20" rx="2" ry="2" />
-            <line x1="12" y1="18" x2="12.01" y2="18" />
-        </svg>
-    )
-}
-
 function TerminalIcon() {
     return (
         <svg
@@ -181,10 +162,6 @@ export function ComposerButtons(props: {
     abortDisabled: boolean
     isAborting: boolean
     onAbort: () => void
-    showSwitchButton: boolean
-    switchDisabled: boolean
-    isSwitching: boolean
-    onSwitch: () => void
     onSend: () => void
 }) {
     const { t } = useTranslation()
@@ -224,19 +201,6 @@ export function ComposerButtons(props: {
                         disabled={props.terminalDisabled}
                     >
                         <TerminalIcon />
-                    </button>
-                ) : null}
-
-                {props.showSwitchButton ? (
-                    <button
-                        type="button"
-                        aria-label={t('composer.switchRemote')}
-                        title={t('composer.switchRemote')}
-                        disabled={props.switchDisabled}
-                        className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-fg)]/60 transition-colors hover:bg-[var(--app-bg)] hover:text-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
-                        onClick={props.onSwitch}
-                    >
-                        <SwitchToRemoteIcon />
                     </button>
                 ) : null}
             </div>

@@ -72,10 +72,12 @@ export type MessagesResponse = {
 }
 export type SendMessageResponse = {
     ok: boolean
+    requestId?: string
     runtime?: {
         active: boolean
         thinking: boolean
         thinkingAt: number
+        state?: 'INACTIVE' | 'READY' | 'RUNNING'
     }
 }
 

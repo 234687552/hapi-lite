@@ -79,7 +79,6 @@ export const AgentStateCompletedRequestSchema = z.object({
 export type AgentStateCompletedRequest = z.infer<typeof AgentStateCompletedRequestSchema>
 
 export const AgentStateSchema = z.object({
-    controlledByUser: z.boolean().nullish(),
     requests: z.record(z.string(), AgentStateRequestSchema).nullish(),
     completedRequests: z.record(z.string(), AgentStateCompletedRequestSchema).nullish()
 })
@@ -156,17 +155,21 @@ export const SyncEventSchema = z.discriminatedUnion('type', [
         type: z.literal('session-added'),
         data: z.unknown().optional()
     }),
-    SessionChangedSchema.extend({
-        type: z.literal('session-updated'),
-        data: z.unknown().optional()
-    }),
     SessionEventBaseSchema.extend({
         type: z.literal('session-removed'),
         sessionId: z.string()
     }),
     SessionChangedSchema.extend({
-        type: z.literal('message-received'),
+        type: z.literal('message-appended'),
         message: DecryptedMessageSchema
+    }),
+    SessionChangedSchema.extend({
+        type: z.literal('session-state-changed'),
+        data: z.object({
+            state: z.enum(['INACTIVE', 'READY', 'RUNNING']),
+            runningAt: z.number().optional(),
+            reason: z.string().optional()
+        }).optional()
     }),
     MachineChangedSchema.extend({
         type: z.literal('machine-updated'),

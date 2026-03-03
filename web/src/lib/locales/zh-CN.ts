@@ -130,7 +130,6 @@ export default {
   'chat.abort': '中止',
   'chat.settings': '设置',
   'chat.terminal': '终端',
-  'chat.switchRemote': '切换到远程模式',
 
   // Terminal
   'terminal.commandName': '命令',
@@ -195,7 +194,6 @@ export default {
   'composer.settings': '设置',
   'composer.terminal': '终端',
   'composer.abort': '中止',
-  'composer.switchRemote': '切换到远程模式',
   'composer.attach': '添加文件',
   'composer.send': '发送',
   'composer.stop': '停止',
@@ -241,7 +239,6 @@ export default {
   'misc.loadOlder': '加载更早的',
   'misc.newMessage': '{n} 条新消息',
   'misc.loadingMessages': '加载消息中…',
-  'misc.typeMessage': "输入 'continue' 继续...",
   'misc.typeAMessage': '输入消息...',
   'misc.offline': '离线',
   'misc.permissionRequired': '需要权限',

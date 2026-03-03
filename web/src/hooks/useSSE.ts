@@ -127,11 +127,15 @@ export function useSSE(options: {
                 return
             }
 
-            if (event.type === 'message-received') {
+            if (event.type === 'message-appended') {
                 ingestIncomingMessages(event.sessionId, [event.message])
             }
 
-            if (event.type === 'session-added' || event.type === 'session-updated' || event.type === 'session-removed') {
+            if (
+                event.type === 'session-added'
+                || event.type === 'session-removed'
+                || event.type === 'session-state-changed'
+            ) {
                 void queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
                 if ('sessionId' in event) {
                     if (event.type === 'session-removed') {

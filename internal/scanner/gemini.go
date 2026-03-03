@@ -45,5 +45,5 @@ func (s *GeminiScanner) watch() {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	tailJSONL(s.stopCh, path, s.sessionID, s.onMessage)
+	tailJSONL(s.stopCh, path, s.sessionID, "gemini", s.onMessage)
 }

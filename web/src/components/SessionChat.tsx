@@ -43,7 +43,7 @@ export function SessionChat(props: {
     const blocksByIdRef = useRef<Map<string, ChatBlock>>(new Map())
     const [forceScrollToken, setForceScrollToken] = useState(0)
     const agentFlavor = props.session.metadata?.flavor ?? null
-    const { abortSession, switchSession, setPermissionMode, setModelMode } = useSessionActions(
+    const { abortSession, setPermissionMode, setModelMode } = useSessionActions(
         props.api,
         props.session.id,
         agentFlavor
@@ -129,12 +129,6 @@ export function SessionChat(props: {
         await abortSession()
         props.onRefresh()
     }, [abortSession, props.onRefresh])
-
-    // Switch to remote handler
-    const handleSwitchToRemote = useCallback(async () => {
-        await switchSession()
-        props.onRefresh()
-    }, [switchSession, props.onRefresh])
 
     const handleViewFiles = useCallback(() => {
         navigate({
@@ -223,14 +217,10 @@ export function SessionChat(props: {
                         allowSendWhenInactive
                         thinking={props.session.thinking}
                         thinkingAt={props.session.thinkingAt}
-                        agentState={props.session.agentState}
-                        contextSize={reduced.latestUsage?.contextSize}
                         inputTokens={reduced.latestUsage?.inputTokens}
                         outputTokens={reduced.latestUsage?.outputTokens}
-                        controlledByUser={props.session.agentState?.controlledByUser === true}
                         onPermissionModeChange={handlePermissionModeChange}
                         onModelModeChange={handleModelModeChange}
-                        onSwitchToRemote={handleSwitchToRemote}
                         onTerminal={props.session.active ? handleViewTerminal : undefined}
                         onDirectSend={(text) => handleSend(text)}
                         autocompleteSuggestions={props.autocompleteSuggestions}
